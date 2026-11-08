@@ -1,0 +1,24 @@
+reddit_creds.json
+*.env
+.env*
+__pycache__/
+*.pyc
+.DS_Store
+data/
+mentions_export/
+intraday_export/
+*.log
+nohup.out
+# generated output
+analysis.html
+mentions.html
+options.html
+review.html
+lynch_report.html
+lynch_site.html
+methodology.html
+proposal.html
+scenarios.html
+*.docx
+*.pdf
+held_tickers.txt

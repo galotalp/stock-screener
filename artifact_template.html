@@ -1,0 +1,197 @@
+<style>
+  :root{
+    --bg:#ffffff; --ink:#333333; --body:#696969; --faint:#8a8a8a;
+    --navy:#00008b; --link:#597ccd; --link-hover:#00008b;
+    --hair:#e6e6e6; --hair2:#f0f0f0; --panel:#fafafb;
+    /* sentiment semantics (kept distinct from the navy accent) */
+    --bull:#1a7f37; --bull-bg:#e8f4ea; --neut:#9a7a12; --neut-bg:#f6f0dc;
+    --bear:#c0392b; --bear-bg:#f7e7e4; --none:#8a8a8a; --none-bg:#f0f0f0;
+    --sans:"Trebuchet MS",Verdana,Geneva,sans-serif;
+    --head:Arial,Helvetica,sans-serif;
+    --mono:"Cascadia Mono","SF Mono",ui-monospace,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box;}
+  body{margin:0;background:var(--bg);color:var(--body);font-family:var(--sans);
+       font-size:16px;line-height:1.5;padding:3px;-webkit-font-smoothing:antialiased;}
+  .wrap{max-width:900px;margin:0 auto;padding:0 15px 80px;}
+
+  /* ---- Top bar: site nav + last-updated ---- */
+  .topbar{display:flex;align-items:center;gap:16px;flex-wrap:wrap;padding:14px 0 0;font-size:13px;}
+  .topbar .home{color:var(--link);text-decoration:none;font-weight:bold;}
+  .topbar .home:hover{color:var(--link-hover);text-decoration:underline;}
+  .topbar .updated{margin-left:auto;color:var(--faint);font-family:var(--mono);font-size:12px;}
+  .topbar .updated b{color:var(--ink);}
+
+  /* ---- Masthead: mirrors the site's h1 with the navy bottom-border ---- */
+  header.mast{padding:18px 0 0;}
+  .howupdate{margin-top:16px;font-size:13px;color:var(--body);}
+  .howupdate summary{cursor:pointer;color:var(--link);font-weight:bold;list-style:revert;}
+  .howupdate summary:hover{color:var(--link-hover);}
+  .howupdate p{margin:10px 0;line-height:1.5;max-width:72ch;}
+  .howupdate pre{background:#f4f4f6;border:1px solid var(--hair);border-radius:4px;
+                 padding:9px 12px;overflow-x:auto;margin:8px 0;}
+  .howupdate code{font-family:var(--mono);font-size:13px;color:var(--navy);}
+  h1{font-family:var(--head);color:#000;font-size:26px;font-weight:bold;
+     border-bottom:3px solid var(--navy);padding:0 0 5px;margin:0 0 14px;line-height:1.2;}
+  .dek{color:var(--body);font-size:16px;max-width:70ch;margin:0 0 4px;line-height:1.45;}
+  .meta{display:flex;flex-wrap:wrap;gap:4px 22px;margin:16px 0 0;font-size:13px;color:var(--faint);}
+  .meta b{color:var(--ink);font-weight:bold;}
+
+  /* ---- Method note ---- */
+  .method{background:var(--panel);border:1px solid var(--hair);border-radius:5px;
+          padding:14px 18px;margin:22px 0 6px;font-size:14px;color:var(--body);
+          display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px 24px;line-height:1.45;}
+  .method h3{grid-column:1/-1;margin:0;font-family:var(--head);font-size:13px;
+             color:var(--navy);font-weight:bold;letter-spacing:.02em;}
+  .method b{color:var(--ink);}
+
+  /* ---- Section header ---- */
+  section{margin-top:44px;}
+  .sechead{border-bottom:3px solid var(--navy);padding-bottom:5px;margin-bottom:4px;
+           display:flex;align-items:baseline;justify-content:space-between;gap:10px;}
+  .sechead h2{font-family:var(--head);color:#000;font-size:21px;font-weight:bold;margin:0;}
+  .sechead .horizon{font-family:var(--mono);font-size:12px;color:var(--link);}
+  .secsub{color:var(--body);font-size:14px;margin:10px 0 16px;max-width:72ch;line-height:1.45;}
+
+  /* ---- Cards ---- */
+  .card{border:1px solid var(--hair);border-radius:5px;padding:16px 18px;margin-bottom:11px;
+        background:#fff;transition:border-color .15s,box-shadow .15s;}
+  .card:hover{border-color:#d3d9e6;box-shadow:0 1px 6px rgba(0,0,32,.05);}
+  .cardtop{display:grid;grid-template-columns:34px 1fr auto;gap:0 14px;align-items:baseline;}
+  .rank{font-family:var(--mono);font-size:14px;color:#b7bdc7;font-variant-numeric:tabular-nums;}
+  .idwrap{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;min-width:0;}
+  .tk{font-family:var(--head);font-size:19px;font-weight:bold;color:#000;text-decoration:none;}
+  .tk:hover{color:var(--link);}
+  .nm{color:var(--body);font-size:14px;}
+  .headline{text-align:right;white-space:nowrap;}
+  .hlnum{font-family:var(--mono);font-size:21px;font-weight:bold;color:var(--navy);
+         font-variant-numeric:tabular-nums;}
+  .hllab{font-size:10px;text-transform:uppercase;letter-spacing:.07em;color:var(--faint);display:block;margin-top:1px;}
+
+  .chips{display:flex;flex-wrap:wrap;gap:6px;margin:9px 0 0 48px;}
+  .chip{font-family:var(--mono);font-size:10.5px;letter-spacing:.02em;text-transform:uppercase;
+        padding:2px 8px;border-radius:3px;border:1px solid var(--hair);color:var(--faint);white-space:nowrap;}
+  .chip.cat{border:none;font-weight:bold;color:#fff;}
+  .chip.cat.fast{background:#1a7f37;} .chip.cat.stalwart{background:#2c6fb0;}
+  .chip.cat.turn{background:#b8860b;} .chip.cat.cyc{background:#b0563e;}
+  .chip.cat.mod{background:#5a6b7a;} .chip.cat.slow{background:#8a8a8a;}
+  .chip.div{border-color:var(--navy);color:var(--navy);background:#eef0fb;}
+
+  .thesis{margin:11px 0 12px 48px;font-size:14.5px;line-height:1.5;color:var(--ink);max-width:68ch;}
+  @media(max-width:560px){.chips,.thesis{margin-left:0;}}
+
+  /* ---- Metrics ---- */
+  .metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:9px 6px;
+           border-top:1px solid var(--hair2);padding-top:11px;margin-left:0;}
+  .metrics>div{display:flex;flex-direction:column;gap:0;}
+  .metrics span{font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:var(--faint);}
+  .metrics b{font-family:var(--mono);font-size:14px;font-weight:bold;color:var(--ink);
+             font-variant-numeric:tabular-nums;}
+
+  /* ---- Sentiment block ---- */
+  .senti{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:13px;
+         border-top:1px dashed var(--hair);padding-top:13px;}
+  @media(max-width:560px){.senti{grid-template-columns:1fr;}}
+  .sblock{background:var(--panel);border:1px solid var(--hair);border-radius:4px;padding:10px 12px;}
+  .shead{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:5px;}
+  .ssrc{font-family:var(--head);font-size:12px;font-weight:bold;color:var(--ink);
+        display:flex;align-items:center;gap:6px;}
+  .ssrc .dot{width:8px;height:8px;border-radius:50%;display:inline-block;}
+  .dot.reddit{background:#ff4500;} .dot.msm{background:#2c6fb0;}
+  .sbadge{font-family:var(--mono);font-size:11px;font-weight:bold;padding:2px 8px;border-radius:20px;white-space:nowrap;}
+  .sbadge.bull{color:var(--bull);background:var(--bull-bg);}
+  .sbadge.neut{color:var(--neut);background:var(--neut-bg);}
+  .sbadge.bear{color:var(--bear);background:var(--bear-bg);}
+  .sbadge.none{color:var(--none);background:var(--none-bg);}
+  /* score meter */
+  .meter{height:5px;border-radius:3px;background:#e9e9ee;overflow:hidden;margin:6px 0 7px;}
+  .meter i{display:block;height:100%;border-radius:3px;}
+  .meter i.bull{background:var(--bull);} .meter i.neut{background:var(--neut);}
+  .meter i.bear{background:var(--bear);} .meter i.none{background:#c8c8c8;}
+  .ssum{font-size:12.5px;color:var(--body);line-height:1.42;}
+
+  .flags{list-style:none;margin:12px 0 0;padding:10px 0 0;border-top:1px dashed var(--hair);
+         display:flex;flex-direction:column;gap:3px;}
+  .flags li{font-size:12.5px;color:#a8791a;padding-left:15px;position:relative;line-height:1.4;}
+  .flags li::before{content:"\26A0";position:absolute;left:0;font-size:10px;top:1px;}
+  .links{display:flex;gap:15px;margin-top:12px;}
+  .links a{font-family:var(--mono);font-size:11.5px;color:var(--link);text-decoration:none;}
+  .links a:hover{color:var(--link-hover);text-decoration:underline;}
+
+  footer{margin-top:52px;border-top:1px solid var(--hair);padding-top:20px;color:var(--faint);
+         font-size:12.5px;line-height:1.6;max-width:80ch;}
+  footer b{color:var(--body);}
+</style>
+
+<div class="wrap">
+  <nav class="topbar">
+    <a class="home" href="../index.html">← galavgay.com</a>
+    <a class="home" href="../projects.html">Projects</a>
+    <span class="updated">Last updated <b>{{UPDATED}}</b></span>
+  </nav>
+
+  <header class="mast">
+    <h1>What Peter Lynch Would Buy You Next</h1>
+    <p class="dek">Every profitable common stock on the NYSE, NASDAQ and TSX, screened by Lynch's own
+       rulebook — reasonable PEG, real growth, a clean balance sheet, and a product you can actually
+       understand — then filtered against my portfolio and the sectors I sit out. Each pick also
+       carries a live read on what Reddit and the mainstream financial press are saying.</p>
+    <div class="meta">
+      <span><b>{{UNIVERSE}}</b> companies survived the filters</span>
+      <span>Two horizons · <b>15 + 15</b> names</span>
+      <span>Fundamentals: Yahoo Finance · Sentiment: live web</span>
+    </div>
+    <details class="howupdate">
+      <summary>How this page updates</summary>
+      <p>The rankings and sentiment come from a Python pipeline (market-wide fundamentals via yfinance
+         plus live web-sentiment research) that takes ~20–30 minutes to run — too heavy for a static
+         web page to trigger on its own. To refresh, I run one command locally that re-screens the
+         market, re-scores sentiment, rebuilds this page and pushes it live:</p>
+      <pre><code>./update_lynch.sh</code></pre>
+      <p>The <b>Last updated</b> date above always reflects the most recent run.</p>
+    </details>
+  </header>
+
+  <div class="method">
+    <h3>How these were chosen</h3>
+    <div><b>Lynch discipline.</b> PEG ≤ ~1 (price justified by growth), sustainable 15–40% growth,
+         low debt, positive free cash flow, and a business you can explain in a sentence.</div>
+    <div><b>Your rules applied.</b> No finance, defense, oil &amp; gas, most pharma, crypto, meme or
+         niche one-product names — and none of the 28 tickers you already own.</div>
+    <div><b>Diversification.</b> Themes you're already heavy in (semis, EV/charging, solar, streaming)
+         are down-weighted so these <em>complement</em> your book rather than double it.</div>
+    <div><b>Sentiment read.</b> Two independent scores per stock — recent Reddit chatter and mainstream
+         media/analyst tone — from live web searches. "No discussion" is reported honestly, not faked.</div>
+  </div>
+
+  <section>
+    <div class="sechead">
+      <h2>Long-Term Holds</h2>
+      <span class="horizon">5-YEAR+ HORIZON</span>
+    </div>
+    <p class="secsub">Ranked for durability: the compounders and undervalued growers Lynch would tuck
+       away and let run. Weighted toward low PEG, sustainable growth, high returns on equity and
+       balance-sheet strength.</p>
+    {{LONG_CARDS}}
+  </section>
+
+  <section>
+    <div class="sechead">
+      <h2>Short-Term Plays</h2>
+      <span class="horizon">~1-YEAR HORIZON</span>
+    </div>
+    <p class="secsub">Ranked for a re-rating within the year: earnings inflecting upward (forward P/E
+       well below trailing), cheap multiples, and meaningful analyst upside. Higher turnover, higher
+       risk — closer to a trade than a marriage.</p>
+    {{SHORT_CARDS}}
+  </section>
+
+  <footer>
+    <p><b>Not financial advice.</b> This is an algorithmic screen built to your stated preferences,
+       using point-in-time Yahoo Finance fundamentals (July 2026) plus live-web sentiment that can be
+       thin or noisy — several names carry data-quality flags for exactly this reason. Sentiment scores
+       reflect what was publicly visible at search time and can flip on a single earnings report.
+       Fundamentals change; a low PEG can mean the market knows something the screen doesn't. Treat this
+       as a <b>research starting point</b>, not a buy list.</p>
+  </footer>
+</div>
