@@ -1,16 +1,21 @@
 """
-analyze_v2.py — does news / social sentiment predict a stock's *next* return,
-once earnings, market moves and reverse causality are accounted for?
+analyze_v2.py — does news sentiment predict a stock's *next* return, once
+earnings, market moves and reverse causality are accounted for?
+
+News only: StockTwits is still collected by the scraper but is not used here.
 
 Read-only over the scraped stores (data/mentions, data/prices, data/earnings);
 writes data/analysis_v2.json, which gen_analysis.py renders. Pure Python (no
 numpy/pandas) so it runs unchanged on the t3.micro's Python 3.9.
 
 Design (each choice fixes a specific flaw in analyze.py / analyze_sessions.py)
-  Stance        sentiment_v2.stance(): StockTwits Bullish/Bearish tags where
-                present, a cleaned finance lexicon otherwise; mentions with no
-                stance (no hits, or news that only reports a price move) are
-                excluded from sentiment but still count as attention.
+  Stance        sentiment_v2.news_stance(): each article's Claude Haiku label
+                (news_llm.py) — bullish +1 / neutral 0 / bearish -1; articles
+                not about the company or only reporting a price move carry no
+                stance but still count as attention. Unlabeled articles fall
+                back to the word list.
+  Slices        all news; "new information" (a specific new fact or event, not
+                about earnings); earnings news. The last two need Haiku labels.
   Time windows  Trading-day windows on the NYSE clock, not UTC dates:
                   C_d  close(d-1) -> close(d)          daily
                   O_d  close(d-1) -> first regular bar (overnight + pre-market)
@@ -39,13 +44,12 @@ import os
 
 import sentiment_v2 as sv
 
-MIN_N = 3              # stanced mentions needed for a window's sentiment to count
-MIN_N_NEWS = 2         # news is sparser; two scored articles in a window
+MIN_N = 1              # articles with a stance needed for a window's sentiment to count
 MIN_ROWS = 20          # rows a stock needs to enter a pooled regression
 MIN_ROWS_EARN = 4      # earnings-only slice: a stock has ~4 earnings days per report
 MIN_MKT = 20           # stocks needed in a window to form the market average
 EARN_PRE, EARN_POST = 1, 2
-SCOPES = ("both", "social", "news")
+SCOPES = ("news", "newinfo", "earnnews")
 REGIMES = ("all", "ex_earn", "earn")
 PERIODS = ("full", "early", "late")
 SPLIT = 0.7
@@ -165,11 +169,12 @@ def load_stock(tk, cal, closes_u, val):
             u = _epoch(m.get("date") or "")
             if u is None:
                 continue
-            fam = sv._family(m.get("source"))
+            if sv._family(m.get("source")) != "news":
+                continue
             fl = {"earn": bool(sv.EARN_RE.search(m.get("blurb") or "")),
-                  "move": fam == "news" and bool(sv.MOVE_RE.search(m.get("blurb") or ""))}
-            s, method = sv.stance(m, fl)
-            _validate(val, m, fam, s, method, fl)
+                  "move": bool(sv.MOVE_RE.search(m.get("blurb") or ""))}
+            s, method, lab = sv.news_stance(tk, m, fl)
+            _validate(val, tk, m, s, method, lab)
             i = bisect.bisect_left(closes_u, u)   # close(i-1) < u <= close(i)
             if i == 0 or i >= T:
                 continue
@@ -177,9 +182,15 @@ def load_stock(tk, cal, closes_u, val):
             kinds = ["C"]
             if ot[i] is not None:
                 kinds.append("O" if u <= ot[i] else "R")
-            if fl["earn"]:
+            if (lab["earn"] if lab else fl["earn"]):
                 earn_m[i] += 1
-            for sc in ("both", fam):
+            scopes = ["news"]
+            if lab is not None and lab.get("about", True) and not lab.get("move"):
+                if lab.get("earn"):
+                    scopes.append("earnnews")
+                elif lab.get("new"):
+                    scopes.append("newinfo")
+            for sc in scopes:
                 for k in kinds:
                     cell = win[sc][k][i]
                     cell[0] += 1
@@ -212,28 +223,36 @@ def load_stock(tk, cal, closes_u, val):
             "n_m": n_m, "n_st": n_st, "n_ev": n_ev, "has_sess": any(o is not None for o in ot)}
 
 
-def _validate(val, m, fam, s, method, fl):
-    mix = val["mix"].setdefault(fam, {})
-    mix[method] = mix.get(method, 0) + 1
-    if fl["earn"]:
-        val["earn"][fam] = val["earn"].get(fam, 0) + 1
-    tag = m.get("st_tag")
-    if fam == "social" and tag in ("Bullish", "Bearish"):
-        truth = 1 if tag == "Bullish" else -1
-        pos, neg = sv.lex_score(m.get("blurb") or "", True)
-        v = val["tagged"]
+def _validate(val, tk, m, s, method, lab):
+    val["mix"][method] = val["mix"].get(method, 0) + 1
+    val["n"] += 1
+    if lab is None:
+        return
+    for f in ("about", "earn", "move", "new"):
+        val["flags"][f] += bool(lab.get(f))
+    val["stance"][lab.get("stance", "neutral")] += 1
+    pos, neg = sv.lex_score(m.get("blurb") or "", False)
+    if pos != neg:                      # agreement with the word list where it has a view
+        v = val["agree"]
         v["n"] += 1
-        cls = "bull" if truth > 0 else "bear"
-        v[cls] += 1
-        if pos != neg:
-            v["new_cov"] += 1
-            v["new_" + cls] += (1 if pos > neg else -1) == truth
-        old = m.get("score")
-        if isinstance(old, (int, float)) and old != 0:
-            v["old_cov"] += 1
-            v["old_" + cls] += (1 if old > 0 else -1) == truth
-        v["old_n_" + cls] += isinstance(old, (int, float)) and old != 0
-        v["new_n_" + cls] += pos != neg
+        llm = sv.LLM_VAL.get(lab.get("stance"), 0.0)
+        if llm == 0:
+            v["llm_neutral"] += 1
+        elif (llm > 0) == (pos > neg):
+            v["same"] += 1
+        else:
+            v["opposite"] += 1
+    # reservoir of labeled examples for the page
+    ex = val["examples"]
+    val["seen"] += 1
+    item = {"tk": tk, "text": (m.get("blurb") or "")[:220], "stance": lab.get("stance"),
+            "flags": [f for f in ("about", "earn", "move", "new") if lab.get(f)]}
+    if len(ex) < 16:
+        ex.append(item)
+    else:
+        j = val["rng"].randrange(val["seen"])
+        if j < 16:
+            ex[j] = item
 
 
 # --------------------------------------------------------------------------
@@ -383,7 +402,7 @@ def _att(cell):
 
 
 def test_rows(key, stocks, scope, regime, keep_date):
-    mn = MIN_N_NEWS if scope == "news" else MIN_N
+    mn = MIN_N
 
     def net(cell):
         return cell[2] / cell[1] if cell[1] >= mn else None
@@ -429,7 +448,7 @@ def test_rows(key, stocks, scope, regime, keep_date):
 def run_tests(stocks, T):
     # split where the data actually is: dense mention coverage starts well after
     # the first price date, so cut at 70% of the dates that enter the main test
-    dates = sorted({r[1] for r in test_rows("daily", stocks, "both", "all", lambda d: True)})
+    dates = sorted({r[1] for r in test_rows("daily", stocks, "news", "all", lambda d: True)})
     cut = dates[int(len(dates) * SPLIT)] if dates else T
     keep = {"full": lambda d: True, "early": lambda d: d < cut, "late": lambda d: d >= cut}
     out = {}
@@ -474,11 +493,11 @@ def long_short(stocks, T, key, regime):
     # so demean by each stock's own average first)
     means = {}
     for tk, st in stocks.items():
-        vals = [net(c) for c in st["win"]["both"]["C" if key == "daily" else "O"]]
+        vals = [net(c) for c in st["win"]["news"]["C" if key == "daily" else "O"]]
         vals = [v for v in vals if v is not None]
         means[tk] = sum(vals) / len(vals) if vals else 0.0
     by_date = {}
-    for tk, d, y, x in test_rows(key, stocks, "both", regime, lambda d: True):
+    for tk, d, y, x in test_rows(key, stocks, "news", regime, lambda d: True):
         by_date.setdefault(d, []).append((x[0] - means[tk], y))
     spreads = []
     for d in sorted(by_date):
@@ -529,7 +548,7 @@ def _pval(r, n):
 
 def per_stock(st, scope, regime):
     W, E, T = st["win"][scope], st["earn"], len(st["earn"])
-    mn = MIN_N_NEWS if scope == "news" else MIN_N
+    mn = MIN_N
 
     def net(cell):
         return cell[2] / cell[1] if cell[1] >= mn else None
@@ -585,14 +604,15 @@ def main():
         return
     T = len(cal)
     closes_u = [c for _, _, c in cal]
-    val = {"mix": {}, "earn": {},
-           "tagged": {"n": 0, "bull": 0, "bear": 0, "new_cov": 0, "old_cov": 0,
-                      "new_bull": 0, "new_bear": 0, "old_bull": 0, "old_bear": 0,
-                      "new_n_bull": 0, "new_n_bear": 0, "old_n_bull": 0, "old_n_bear": 0}}
+    import random
+    val = {"n": 0, "mix": {}, "flags": {"about": 0, "earn": 0, "move": 0, "new": 0},
+           "stance": {"bullish": 0, "bearish": 0, "neutral": 0},
+           "agree": {"n": 0, "same": 0, "opposite": 0, "llm_neutral": 0},
+           "examples": [], "seen": 0, "rng": random.Random(11)}
     stocks = {}
     for tk in tickers:
         st = load_stock(tk, cal, closes_u, val)
-        if st is not None and st["n_m"]:
+        if st is not None:          # every stock with prices feeds the market average
             stocks[tk] = st
     abnormal(stocks, T)
     tests, cut = run_tests(stocks, T)
@@ -603,6 +623,8 @@ def main():
     per = {}
     k1 = {sc: {rg: [] for rg in ("all", "ex_earn")} for sc in SCOPES}
     for tk, st in stocks.items():
+        if not st["n_m"]:
+            continue
         rec = {"n_m": st["n_m"], "n_st": st["n_st"], "n_ev": st["n_ev"], "daily": {}, "sess": {}, "k1": {}}
         for sc in SCOPES:
             rec["daily"][sc], rec["sess"][sc], rec["k1"][sc] = {}, {}, {}
@@ -619,26 +641,21 @@ def main():
     fdr = {sc: {rg: {"n": len(ps), "sig05": sum(p < 0.05 for p in ps),
                      "expected05": round(0.05 * len(ps), 1), "fdr10": bh_count(ps)}
                 for rg, ps in v.items()} for sc, v in k1.items()}
-    t = val["tagged"]
-
-    def scorer(px):
-        rb = t[px + "_bull"] / t[px + "_n_bull"] if t[px + "_n_bull"] else None
-        rr = t[px + "_bear"] / t[px + "_n_bear"] if t[px + "_n_bear"] else None
-        return {"coverage": round(t[px + "_cov"] / t["n"], 3) if t["n"] else None,
-                "bull_recall": None if rb is None else round(rb, 3),
-                "bear_recall": None if rr is None else round(rr, 3),
-                "balanced_acc": None if rb is None or rr is None else round((rb + rr) / 2, 3)}
+    nl = sum(val["stance"].values())
     validation = {
-        "tagged_posts": t["n"], "tagged_bull_share": round(t["bull"] / t["n"], 3) if t["n"] else None,
-        "new_lexicon": scorer("new"), "old_score": scorer("old"),
-        "mix": val["mix"], "earn_related": val["earn"],
+        "n_news": val["n"], "n_llm": nl, "mix": val["mix"],
+        "llm_share": round(nl / val["n"], 3) if val["n"] else 0,
+        "stance": val["stance"], "flags": val["flags"], "agree": val["agree"],
+        "examples": sorted(val["examples"], key=lambda e: (e["stance"] or "", e["tk"])),
     }
     has_sess = [i for i in range(T) if any(st["rO"][i] is not None for st in stocks.values())]
     out = {
         "generated": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%MZ"),
-        "params": {"min_n": MIN_N, "min_n_news": MIN_N_NEWS, "min_rows": MIN_ROWS, "earn_window": [-EARN_PRE, EARN_POST],
+        "params": {"min_n": MIN_N, "min_rows": MIN_ROWS, "model": "claude-haiku-5-5", "earn_window": [-EARN_PRE, EARN_POST],
                    "split": SPLIT},
-        "coverage": {"n_stocks": len(stocks), "n_mentions": sum(s["n_m"] for s in stocks.values()),
+        "coverage": {"n_stocks": sum(1 for s in stocks.values() if s["n_m"]),
+                     "n_market": len(stocks),
+                     "n_mentions": sum(s["n_m"] for s in stocks.values()),
                      "n_stanced": sum(s["n_st"] for s in stocks.values()),
                      "daily_from": cal[1][0], "daily_to": cal[-1][0], "n_days": T - 1,
                      "split_date": cal[cut][0] if cut < T else None,
@@ -650,8 +667,8 @@ def main():
     with open(tmp, "w") as fh:
         json.dump(out, fh, separators=(",", ":"))
     os.replace(tmp, OUT)
-    r = tests["daily"]["res"]["both"]["ex_earn"]["full"] or {}
-    print(f"analyze_v2: {len(stocks)} stocks, {T - 1} days; daily test (ex-earnings) "
+    r = tests["daily"]["res"]["news"]["ex_earn"]["full"] or {}
+    print(f"analyze_v2: {out['coverage']['n_stocks']} stocks with news, {T - 1} days; daily test (ex-earnings) "
           f"b={r.get('b')}bp t={r.get('t')} n={r.get('n')}")
 
 

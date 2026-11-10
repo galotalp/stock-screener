@@ -16,13 +16,12 @@ Chart model
     and after-hours slots get equal width; every closed run (overnight, weekend,
     holiday) is collapsed client-side to one fixed-width marked break.
   - Price: hourly bars from data/prices/<T>_intraday.json, placed at their slot.
-  - Sentiment: per slot, the mean stance and count of mentions that carry one
-    (sentiment_v2.stance: StockTwits Bullish/Bearish tag, else a cleaned finance
-    lexicon; news that only reports a price move and text with no hits have no
-    stance), plus the count of all mentions. Kept separately for social and news
-    so the source control can recombine them. The page draws a
+  - Sentiment (news only; StockTwits is still scraped but not shown): per slot,
+    the mean stance and count of articles that carry one (sentiment_v2.news_stance:
+    the article's Claude Haiku label, word list until it is labeled), plus the
+    count of all articles. The page draws a
     time-decayed level: sum(w*score)/sum(w) with w = 0.5^(age/half-life), so the
-    half-life (6h or 14d) is real clock time, the level holds through quiet spells,
+    half-life (1d or 14d) is real clock time, the level holds through quiet spells,
     and it is hidden once the decayed evidence falls below MIN_WEIGHT mentions.
     Mentions before the grid start seed that level (the "init" block).
   - Study-wide results, per-stock lead/lag and session lead/lag come from
@@ -41,7 +40,7 @@ import shutil
 import sentiment_v2 as sv
 
 SLOT = 1800                      # half-hour slots, seconds
-FAST_HL_SLOTS = 12               # 6 hours
+FAST_HL_SLOTS = 48               # 1 day (news is a few articles a day)
 SLOW_HL_SLOTS = 14 * 48          # 14 days
 SERIES_DIR = "series"
 
@@ -172,8 +171,8 @@ def build_series(tk, grid):
         except Exception:
             pass
     # ---- mentions: per family, per slot [sum, count]; pre-grid kept for init ----
-    acc = {"social": {}, "news": {}}
-    pre = {"social": {}, "news": {}}
+    acc = {"news": {}}
+    pre = {"news": {}}
     p = f"data/mentions/{tk}.jsonl"
     if os.path.exists(p):
         for line in open(p, encoding="utf-8"):
@@ -184,14 +183,16 @@ def build_series(tk, grid):
                 m = json.loads(line)
             except Exception:
                 continue
+            if _family(m.get("source")) != "news":
+                continue
             u = _epoch(m.get("date") or "")
             if u is None:
                 continue
             k = (u - start) // SLOT
             if k >= n:
                 continue
-            s, _ = sv.stance(m)
-            tgt = (acc if k >= 0 else pre)[_family(m.get("source"))]
+            s, _, _ = sv.news_stance(tk, m)
+            tgt = (acc if k >= 0 else pre)["news"]
             cell = tgt.setdefault(k, [0.0, 0, 0])   # stance sum, stanced count, all mentions
             cell[2] += 1
             if s is not None:
@@ -219,7 +220,7 @@ def build_series(tk, grid):
                 cell[0] += s
                 cell[1] += c
     out["init"] = {}
-    for scope, slots in (("both", both_pre), ("social", pre["social"]), ("news", pre["news"])):
+    for scope, slots in (("news", both_pre),):
         sl = {k: v[:2] for k, v in slots.items() if v[1]}
         out["init"][scope] = {"f": _decayed(sl, FAST_HL_SLOTS, -1),
                               "s": _decayed(sl, SLOW_HL_SLOTS, -1)}
@@ -499,18 +500,18 @@ TEMPLATE = r"""
 
   <h1>Sentiment vs Price</h1>
   <div id="freshBar" class="freshbar" style="display:none;"></div>
-  <p class="intro">Does what people say about a stock in the news and on social media tell us anything about where its
-     price goes <b>next</b>, once earnings reports, market-wide moves and the fact that people talk about moves that already
-     happened are taken into account? The first section answers that across every tracked stock; the second lets you look
+  <p class="intro">Does the <b>news</b> about a stock tell us anything about where its price goes <b>next</b>, once
+     earnings reports, market-wide moves and the fact that a lot of financial news just reports moves that already happened are
+     taken into account? <span id="introLlm"></span> The first section answers that across every tracked stock; the second lets you look
      at one stock at a time. Methodology follows the <a href="proposal.html">research proposal</a>.</p>
 
   <section class="card" id="study">
     <h3>Across all stocks</h3>
     <div class="verdict" id="verdict"></div>
     <div class="vcontrols">
-      <div class="grp"><span>Source</span>
-        <div class="seg" id="stScope" role="group" aria-label="Mention source for the study results">
-          <button type="button" data-v="both">Both</button><button type="button" data-v="social">Social</button><button type="button" data-v="news">News</button></div></div>
+      <div class="grp"><span>Articles</span>
+        <div class="seg" id="stScope" role="group" aria-label="Which news articles the study results use">
+          <button type="button" data-v="news">All news</button><button type="button" data-v="newinfo">New information</button><button type="button" data-v="earnnews">Earnings news</button></div></div>
       <div class="grp"><span>Earnings days</span>
         <div class="seg" id="stReg" role="group" aria-label="Earnings regime for the study results">
           <button type="button" data-v="all">Included</button><button type="button" data-v="ex_earn">Excluded</button><button type="button" data-v="earn">Only</button></div></div>
@@ -532,8 +533,8 @@ TEMPLATE = r"""
   <div class="howto">
     <p style="margin:0 0 8px;"><b>Reading the chart.</b> The <b style="color:var(--price)">blue line</b> is the
        <b>price</b> (left axis) and the <b style="color:var(--senti)">orange line</b> is the <b>sentiment level</b>
-       (right axis, −1 bearish to +1 bullish), a time-decayed average of mention stances. Orange dots are the raw averages per
-       time bucket, sized by how many mentions had a stance. Time runs in half-hour steps across pre-market, regular hours and
+       (right axis, −1 bearish to +1 bullish), a time-decayed average of the stance of news articles about the stock.
+       Orange dots are the raw averages per time bucket, sized by how many articles had a stance. Time runs in half-hour steps across pre-market, regular hours and
        after-hours; closed time (overnight, weekends, holidays) is squeezed into a marked break. Pick a window, or
        <b>drag across the chart to zoom</b>.</p>
     <p style="margin:0;">The chart shows timing only. The <b>lead/lag charts</b> below it test it, with a band showing how
@@ -542,10 +543,10 @@ TEMPLATE = r"""
 
   <div class="controls">
     <div class="fld"><label for="tkSel">Stock</label><select id="tkSel"></select></div>
-    <div class="fld"><label for="srcSel">Mention source</label>
-      <select id="srcSel"><option value="both">Both</option><option value="social">Social media</option><option value="news">News</option></select></div>
+    <div class="fld"><label for="srcSel">Lead/lag uses</label>
+      <select id="srcSel"><option value="news">All news</option><option value="newinfo">New information</option><option value="earnnews">Earnings news</option></select></div>
     <div class="fld"><label for="catSel">Group / filter stocks by</label>
-      <select id="catSel"><option value="all">All stocks</option><option value="sector">Sector</option><option value="mcap_bucket">Market cap</option><option value="source_favored">Source-favored</option></select></div>
+      <select id="catSel"><option value="all">All stocks</option><option value="sector">Sector</option><option value="mcap_bucket">Market cap</option></select></div>
     <div class="fld" id="catValWrap" style="display:none;"><label for="catVal">&nbsp;</label><select id="catVal"></select></div>
     <div class="fld"><label for="earnReg">Earnings days</label>
       <select id="earnReg"><option value="all">Included</option><option value="ex_earn">Excluded</option></select></div>
@@ -560,7 +561,7 @@ TEMPLATE = r"""
     <div class="vcontrols">
       <div class="grp"><span>Smoothing</span>
         <div class="seg" id="smooth" role="group" aria-label="Sentiment smoothing">
-          <button type="button" data-s="fast">6h</button><button type="button" data-s="slow">14d</button></div></div>
+          <button type="button" data-s="fast">1d</button><button type="button" data-s="slow">14d</button></div></div>
       <div class="grp"><span>Window</span>
         <div class="seg" id="range" role="group" aria-label="Time range">
           <button type="button" data-d="2">2D</button><button type="button" data-d="5">5D</button>
@@ -571,8 +572,8 @@ TEMPLATE = r"""
     <div class="vstats" id="vstats"></div>
     <div class="vlegend">
       <span><i class="sw-line" style="background:var(--price)"></i>Price, $ (left axis)</span>
-      <span><i class="sw-line" style="background:var(--senti)"></i><b id="sentiKey">Sentiment, 6h half-life</b> (right axis, −1 to +1)</span>
-      <span><i class="sw-dot"></i><span id="dotKey">Mean per half-hour with mentions (size = count)</span></span>
+      <span><i class="sw-line" style="background:var(--senti)"></i><b id="sentiKey">Sentiment, 1-day half-life</b> (right axis, −1 to +1)</span>
+      <span><i class="sw-dot"></i><span id="dotKey">Mean per half-hour with articles (size = count)</span></span>
       <span><i class="sw-box" style="background:#1f1f1d"></i>Extended hours</span>
       <span><i class="sw-box" style="background:#262624"></i>Closed (collapsed)</span>
       <span id="earnLegend" style="display:none;"><i class="sw-earn"></i>Earnings report (hover)</span>
@@ -586,7 +587,7 @@ TEMPLATE = r"""
   <details class="card">
     <summary>Table view (newest first)</summary>
     <div class="tblwrap"><table>
-      <thead><tr><th>Time (ET)</th><th>Session</th><th class="num">Price</th><th class="num">Sentiment level</th><th class="num">Mentions</th><th class="num">With stance (mean)</th></tr></thead>
+      <thead><tr><th>Time (ET)</th><th>Session</th><th class="num">Price</th><th class="num">Sentiment level</th><th class="num">Articles</th><th class="num">With stance (mean)</th></tr></thead>
       <tbody id="tbody"></tbody></table></div>
   </details>
 
@@ -607,8 +608,8 @@ TEMPLATE = r"""
     <div class="vwrap" id="swrap"><svg id="sesslag" viewBox="0 0 960 230" role="img" aria-label="Half-session lead-lag correlation with chance band"></svg><div id="stip" class="tip" hidden></div></div>
   </section>
 
-  <footer>Research prototype. Stance is the poster’s own StockTwits Bullish/Bearish tag where given, otherwise a finance word
-     list (Loughran-McDonald based, with price-move and uncertainty words removed); no LLM. Results update with every daily run.
+  <footer>Research prototype. News only. Each article is labelled by Claude Haiku (stance for the company, about earnings,
+     new information, or a recap of a price move); articles not labelled yet use a finance word list. Results update with every daily run.
      See the <a href="proposal.html">research proposal</a>.</footer>
 </div>
 
@@ -701,19 +702,16 @@ function decode(j){
   const P=new Float64Array(N).fill(NaN);
   const pk=undelta(j.p); pk.forEach((k,i)=>{ P[k]=j.pv[i]; });
   const fam={};
-  ['social','news'].forEach(f=>{ const m=j.m[f]||[[],[],[],[]]; const ks=undelta(m[0]);
+  ['news'].forEach(f=>{ const m=j.m[f]||[[],[],[],[]]; const ks=undelta(m[0]);
     const sum=new Float64Array(N), cnt=new Int32Array(N), tot=new Int32Array(N);
     ks.forEach((k,i)=>{ cnt[k]=m[2][i]; sum[k]=m[1][i]/1000*m[2][i]; tot[k]=m[3]?m[3][i]:m[2][i]; });
     fam[f]={sum,cnt,tot}; });
   return {t:j.t, i0:j.i0, i1:j.i1, P, fam, init:j.init, scopes:{}, ll:j.ll||{}, earn:j.earn||[]};
 }
-const HL={fast:12, slow:14*48}, MIN_WEIGHT=0.05;
+const HL={fast:48, slow:14*48}, MIN_WEIGHT=0.05;
 function scopeData(S, scope){
   if(S.scopes[scope]) return S.scopes[scope];
-  let sum, cnt, tot;
-  if(scope==='both'){ sum=new Float64Array(N); cnt=new Int32Array(N); tot=new Int32Array(N);
-    for(let k=0;k<N;k++){ sum[k]=S.fam.social.sum[k]+S.fam.news.sum[k]; cnt[k]=S.fam.social.cnt[k]+S.fam.news.cnt[k]; tot[k]=S.fam.social.tot[k]+S.fam.news.tot[k]; } }
-  else { sum=S.fam[scope].sum; cnt=S.fam[scope].cnt; tot=S.fam[scope].tot; }
+  const sum=S.fam.news.sum, cnt=S.fam.news.cnt, tot=S.fam.news.tot;
   const lev={};
   for(const sp of ['fast','slow']){
     const f=Math.pow(0.5,1/HL[sp]), out=new Float64Array(N);
@@ -730,7 +728,7 @@ function scopeData(S, scope){
 const VW=960, PX0=84, PX1=896, PW=PX1-PX0, PY0=14, PY1=318, PH=PY1-PY0;
 const RIB_Y=330, RIB_H=20, TICK_Y=368, DAY_Y=388;
 const EDGE={0:'',240:'4a',570:'9:30',960:'4p',1200:'8p'};
-const view={tk:null, scope:'both', smooth:'fast', days:14, zoom:null};
+const view={tk:null, scope:'news', lag:'news', smooth:'fast', days:14, zoom:null};
 const svg=$('chart'), wrap=$('vwrap'), tip=$('tip');
 function fitSvg(){ const w=wrap.clientWidth||VW; svg.setAttribute('width',w); svg.setAttribute('height',Math.round(w*400/VW)); }
 // Windows count TRADING time: "2D" = the last 2 trading days' worth of open
@@ -813,7 +811,7 @@ function drawMain(){
       const f=FIRSTOPEN[DAYI[a]]; if(c){ const uc=(f>=a&&f<=e)? (U[f]+U[Math.min(e,f+31)+1])/2 : (U[a]+U[e+1])/2; dots.push([uc,s/c,c]); if(c>cmax) cmax=c; } a=e+1; } }
   const bucketName=B===1?'half-hour':B===2?'hour':B===8?'4 hours':'day';
   dots.forEach(d=>el('circle',{cx:X(d[0]).toFixed(1),cy:yS(d[1]).toFixed(1),r:(2.2+2.8*Math.sqrt(d[2]/cmax)).toFixed(1),class:'dot-mention'},svg));
-  $('dotKey').textContent='Mean per '+bucketName+' with mentions (size = count)';
+  $('dotKey').textContent='Mean per '+bucketName+' with articles (size = count)';
   // 7. session ribbon
   SEGS.forEach(sg=>{ const a=Math.max(sg[0],uA), b=Math.min(sg[1],uB); if(b<=a) return;
     const x0=X(a), x1=X(b); el('rect',{x:x0,y:RIB_Y,width:x1-x0,height:RIB_H,class:'rb-'+(sg[2]==='?'?'q':sg[2])},svg);
@@ -843,7 +841,7 @@ function drawMain(){
     const c=sd.cnt[j], tt=sd.tot[j];
     tip.innerHTML='<div class="tt-head">'+DAYL[DAYI[j]]+' · '+fmtTod(TOD[j])+' ET</div><div>'+NAMES[CODE[j]]+'</div>'+
       '<div>Price: '+pt+'</div><div>Sentiment level: '+(SER[j]===SER[j]?sgn(SER[j]):'—')+'</div>'+
-      '<div>Mentions: '+tt+(tt? ' · '+c+' with a stance'+(c?' (mean '+sgn(sd.sum[j]/c)+')':''):'')+'</div>';
+      '<div>Articles: '+tt+(tt? ' · '+c+' with a stance'+(c?' (mean '+sgn(sd.sum[j]/c)+')':''):'')+'</div>';
     tip.hidden=false; const rw=svg.getBoundingClientRect().width; let left=x/VW*rw+14; if(left>rw-250) left-=284; tip.style.left=Math.max(0,left)+'px';
   }
   function hide(){ [xh,dP,dS].forEach(n=>n.setAttribute('visibility','hidden')); tip.hidden=true; }
@@ -863,12 +861,12 @@ function drawMain(){
   for(let i=Math.max(0,S.i1-47);i<=S.i1;i++) n24+=sd.tot[i];
   const tile=(k,v,s)=>'<div class="tile"><div class="k">'+k+'</div><div class="v">'+v+'</div><div class="s">'+s+'</div></div>';
   $('vstats').innerHTML=tile('Latest price',lp===lp?'$'+lp.toFixed(2):'—',lpi>=0?DAYL[DAYI[lpi]]+', '+fmtTod(TOD[lpi])+' ET':'no price bars yet')+
-    tile('Sentiment level',ls===ls?sgn(ls):'—',(view.smooth==='fast'?'6-hour':'14-day')+' half-life, −1 to +1')+
-    tile('Mentions, last 24h',String(n24),view.scope==='both'?'social + news':view.scope);
-  $('sentiKey').textContent=view.smooth==='fast'?'Sentiment, 6h half-life':'Sentiment, 14-day half-life';
+    tile('Sentiment level',ls===ls?sgn(ls):'—',(view.smooth==='fast'?'1-day':'14-day')+' half-life, −1 to +1')+
+    tile('News articles, last 24h',String(n24),'about this stock');
+  $('sentiKey').textContent=view.smooth==='fast'?'Sentiment, 1-day half-life':'Sentiment, 14-day half-life';
   $('vnote').textContent='Each slot is 30 minutes (US Eastern). Pre-market, regular and after-hours share one scale; each closed run is one fixed-width break, so order is kept but spacing inside a break is not. '+
-    'The line is a time-decayed average of mention stances (poster’s Bullish/Bearish tag where given, otherwise the finance word list) with the chosen half-life; it holds its value through quiet spells and is hidden once fewer than '+MIN_WEIGHT+' mentions’ worth of decayed evidence remain. '+
-    'Dots are raw mean stances per '+bucketName+' (coarser on longer windows), sized by how many mentions had a stance. Mentions with no stance (no finance words, or news that only reports a price move) count toward volume but not toward sentiment. This chart shows timing only; the tests are below.';
+    'The line is a time-decayed average of article stances (bullish +1, neutral 0, bearish −1, from each article’s AI label) with the chosen half-life; it holds its value through quiet spells and is hidden once fewer than '+MIN_WEIGHT+' articles’ worth of decayed evidence remain. '+
+    'Dots are raw mean stances per '+bucketName+' (coarser on longer windows), sized by how many articles had a stance. Articles that are not really about the company, or only report a price move, count toward volume but not toward sentiment. This chart shows timing only; the tests are below.';
   const rows=[];
   for(let i=i1;i>=i0 && rows.length<300;i--){ const c=sd.cnt[i]; if(P[i]!==P[i] && !sd.tot[i]) continue;
     rows.push('<tr><td>'+DAYL[DAYI[i]]+' '+fmtTod(TOD[i])+'</td><td>'+NAMES[CODE[i]]+'</td><td class="num">'+(P[i]===P[i]?'$'+P[i].toFixed(2):'—')+
@@ -889,11 +887,11 @@ function loadMain(tk){
 // ======================================================================
 // Study-wide results (analysis_v2.json)
 // ======================================================================
-const ST=D.study, study={scope:'both', reg:'ex_earn'};
+const ST=D.study, study={scope:'news', reg:'ex_earn'};
 const PRED=[['daily','Next trading day','sentiment over a day → next day, close to close'],
             ['open','Regular session','overnight + pre-market sentiment → that day’s 9:30–4:00 return'],
             ['overnight','Overnight gap','regular-session sentiment → close to next open']];
-const SCOPE_NAME={both:'news and social',social:'social-media',news:'news'};
+const SCOPE_NAME={news:'news',newinfo:'new-information news',earnnews:'earnings-news'};
 const REG_NAME={all:'earnings days included',ex_earn:'earnings days excluded',earn:'earnings days only'};
 function fmtB(b){ return (b>0?'+':b<0?'−':'')+Math.abs(b).toFixed(1); }
 function fmtP(p){ return p==null?'—':p<0.001?'p < 0.001':'p = '+p.toFixed(p<0.01?3:2); }
@@ -902,6 +900,10 @@ function robust(key){ const f=res(key,study.scope,study.reg,'full'), e=res(key,s
   return !!(f && e && l && f.p<0.05 && Math.sign(e.b)===Math.sign(f.b) && Math.sign(l.b)===Math.sign(f.b) && Math.abs(e.t)>=1 && Math.abs(l.t)>=1); }
 function drawStudy(){
   const vd=$('verdict');
+  (function(){ const v=(ST&&ST.validation)||{}, sh=v.n_news?v.n_llm/v.n_news:0;
+    $('introLlm').textContent= sh>=0.95? 'Every article is read and labelled by an AI model (Claude Haiku).'
+      : sh>0? 'Articles are being labelled by an AI model (Claude Haiku): '+Math.round(100*sh)+'% so far; the rest use a finance word list until they are labelled.'
+      : 'Articles are scored with a finance word list for now; AI labelling (Claude Haiku) has not run yet.'; })();
   if(!ST){ vd.innerHTML='The study-wide analysis has not been generated yet (data/analysis_v2.json missing).'; return; }
   syncSeg2('stScope',study.scope); syncSeg2('stReg',study.reg);
   const sc=study.scope, rg=study.reg, who=SCOPE_NAME[sc];
@@ -927,12 +929,12 @@ function drawStudy(){
   $('studyTiles').innerHTML=
     t('Next-day effect',d?fmtB(d.b)+' bp':'—',d?'per 1 sd of sentiment · 95% CI '+fmtB(d.b-1.96*d.se)+' to '+fmtB(d.b+1.96*d.se)+' · '+fmtP(d.p):'not enough data')+
     t('Sentiment follows price',re?re.b.toFixed(2)+' sd':'—',re?'per 1 sd return the day before · t = '+re.t.toFixed(1):'not enough data')+
-    t('Top vs bottom fifth',ls?fmtB(ls.mean_bp)+' bp/day':'—',ls?'next-day spread, both sources'+(rg==='earn'?', earnings days included':'')+' · '+fmtP(ls.p)+' · '+ls.nd+' days':'needs 50+ stocks a day')+
+    t('Top vs bottom fifth',ls?fmtB(ls.mean_bp)+' bp/day':'—',ls?'next-day spread, all news'+(rg==='earn'?', earnings days included':'')+' · '+fmtP(ls.p)+' · '+ls.nd+' days':'needs 50+ stocks a day')+
     t('Stocks with a “significant” next-day link',fd?fd.sig05+' of '+fd.n:'—',fd?'about '+Math.round(fd.expected05)+' expected by chance · '+fd.fdr10+' survive a false-discovery check'+(rg==='earn'?' (earnings days included)':''):'');
   drawForest(sc,rg);
   const cv=ST.coverage||{};
   $('studyNote').textContent='Effects are in basis points (0.01%) of market-adjusted return per one standard deviation of a stock’s own sentiment, from one regression pooled across all stocks with stock fixed effects, controls for the return already known and for mention volume, and standard errors clustered by date. '+
-    'Data: '+(cv.n_stocks||0)+' stocks, '+(cv.n_mentions||0).toLocaleString()+' mentions ('+(cv.n_stanced||0).toLocaleString()+' with a stance); daily prices '+cv.daily_from+' to '+cv.daily_to+', hourly prices from '+cv.sess_from+'. Holdout split at '+cv.split_date+'. Updated '+ST.generated+'.';
+    'Data: '+(cv.n_stocks||0)+' stocks with news, '+(cv.n_mentions||0).toLocaleString()+' articles ('+(cv.n_stanced||0).toLocaleString()+' with a stance); daily prices '+cv.daily_from+' to '+cv.daily_to+', hourly prices from '+cv.sess_from+'. Holdout split at '+cv.split_date+'. Updated '+ST.generated+'.';
   drawMethods();
 }
 function syncSeg2(id,val){ document.querySelectorAll('#'+id+' button').forEach(b=>{ const on=b.getAttribute('data-v')===val; b.className=on?'on':''; b.setAttribute('aria-pressed',on?'true':'false'); }); }
@@ -968,30 +970,38 @@ function drawForest(sc,rg){
   });
 }
 function drawMethods(){
-  const v=ST.validation||{}, nw=v.new_lexicon||{}, od=v.old_score||{}, mix=v.mix||{}, P=ST.params||{};
-  const pc=x=>x==null?'—':(100*x).toFixed(0)+'%';
-  const soc=mix.social||{}, nws=mix.news||{}, ns=(soc.tag||0)+(soc.lex||0)+(soc.none||0), nn=(nws.lex||0)+(nws.move||0)+(nws.none||0);
-  $('methods').innerHTML=
-   '<h4>Stance (how each mention is scored)</h4><ul>'+
-   '<li><b>StockTwits posts tagged Bullish or Bearish by the poster</b> use that tag (+1 / −1): '+pc(ns?(soc.tag||0)/ns:null)+' of social mentions.</li>'+
-   '<li>Other text uses a finance word list based on Loughran-McDonald, with words that describe a price move (“fell”, “surged”, “rally”) and uncertainty words (“risk”, “volatile”) removed, and simple negation handling. Stance = (bullish − bearish hits) / (all hits).</li>'+
-   '<li><b>No stance</b> when a mention has no hits ('+pc(ns?(soc.none||0)/ns:null)+' of social, '+pc(nn?(nws.none||0)/nn:null)+' of news), and for news whose text only reports a price move ('+pc(nn?(nws.move||0)/nn:null)+' of news): a headline that says a stock fell is about the past move, and scoring it would make sentiment follow price by construction. These still count as mention volume.</li>'+
-   '<li>A window needs at least '+P.min_n+' mentions with a stance ('+P.min_n_news+' for news) to have a sentiment value.</li></ul>'+
-   '<h4>Checking the word list against posters’ own tags</h4><p>On '+(v.tagged_posts||0).toLocaleString()+' tagged posts ('+pc(v.tagged_bull_share)+' Bullish), scoring the text alone and ignoring the tag:</p>'+
-   '<table><thead><tr><th>Scorer</th><th class="num">Posts with a score</th><th class="num">Bullish caught</th><th class="num">Bearish caught</th><th class="num">Balanced accuracy</th></tr></thead><tbody>'+
-   '<tr><td>Word list used here</td><td class="num">'+pc(nw.coverage)+'</td><td class="num">'+pc(nw.bull_recall)+'</td><td class="num">'+pc(nw.bear_recall)+'</td><td class="num">'+pc(nw.balanced_acc)+'</td></tr>'+
-   '<tr><td>Previous word list</td><td class="num">'+pc(od.coverage)+'</td><td class="num">'+pc(od.bull_recall)+'</td><td class="num">'+pc(od.bear_recall)+'</td><td class="num">'+pc(od.balanced_acc)+'</td></tr></tbody></table>'+
-   '<p style="margin-top:6px;">A word list reads only about a quarter of short social posts, and gets roughly one in four of those wrong (50% is a coin flip). That is why the tags carry most of the social signal, and why a model-based scorer would be the next upgrade.</p>'+
-   '<h4>Timing</h4><ul><li>Windows follow the NYSE clock, not calendar dates: <b>day</b> = prior close to close; <b>overnight + pre-market</b> = prior close to the first regular-hours price; <b>regular</b> = that price to the close.</li>'+
-   '<li>Sentiment is always measured in a window that ends before the return window starts.</li></ul>'+
+  const v=ST.validation||{}, P=ST.params||{}, mix=v.mix||{}, fl=v.flags||{}, stn=v.stance||{}, ag=v.agree||{};
+  const pc=x=>x==null||!isFinite(x)?'—':(100*x).toFixed(0)+'%', nl=v.n_llm||0, nn=v.n_news||0;
+  const esc=t=>String(t).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+  let html='<h4>Which articles</h4><p>News items collected for each tracked stock (Yahoo Finance). Social media (StockTwits) is still collected but is not used: short posts are noisy, and much of their apparent “sentiment” is a reaction to the price.</p>'+
+   '<h4>How each article is scored</h4><ul>'+
+   '<li>An AI model ('+(P.model||'Claude Haiku')+') reads each article’s headline and summary for the stock it was collected under, and labels: <b>stance</b> for that company’s shareholders (bullish +1, neutral 0, bearish −1), judged from the information rather than any price move it mentions; whether it is <b>about the company</b> at all; whether it is about <b>earnings</b>; whether it is mainly a <b>recap of a price move</b>; and whether it reports <b>new information</b> (a specific fact or event).</li>'+
+   '<li>Articles not about the company, and price-move recaps, get no stance: a headline that says a stock fell is about the past move, and scoring it would make sentiment follow price by construction. They still count as article volume.</li>'+
+   '<li><b>New information</b> = a specific new fact or event that is not about earnings; <b>earnings news</b> = anything about results or guidance. These slices separate news from earnings directly.</li>'+
+   '<li>Labelled so far: '+nl.toLocaleString()+' of '+nn.toLocaleString()+' articles ('+pc(nn?nl/nn:null)+'). Articles not labelled yet use a finance word list (Loughran-McDonald based, price-move and uncertainty words removed) until the next run labels them.</li></ul>';
+  if(nl){
+    html+='<h4>What the labels look like</h4><table><thead><tr><th>Label</th><th class="num">Share of labelled articles</th></tr></thead><tbody>'+
+      '<tr><td>Bullish / neutral / bearish</td><td class="num">'+pc(stn.bullish/nl)+' / '+pc(stn.neutral/nl)+' / '+pc(stn.bearish/nl)+'</td></tr>'+
+      '<tr><td>Not about the company</td><td class="num">'+pc(1-fl.about/nl)+'</td></tr>'+
+      '<tr><td>Price-move recap</td><td class="num">'+pc(fl.move/nl)+'</td></tr>'+
+      '<tr><td>About earnings</td><td class="num">'+pc(fl.earn/nl)+'</td></tr>'+
+      '<tr><td>New information</td><td class="num">'+pc(fl.new/nl)+'</td></tr></tbody></table>'+
+      '<p style="margin-top:6px;">Against the word list, where it has a view ('+(ag.n||0).toLocaleString()+' articles): same direction '+pc(ag.n?ag.same/ag.n:null)+', opposite '+pc(ag.n?ag.opposite/ag.n:null)+', model says neutral '+pc(ag.n?ag.llm_neutral/ag.n:null)+'. There is no ground truth for news, so the examples below are there to be checked by eye.</p>';
+    const ex=v.examples||[];
+    if(ex.length) html+='<h4>Random labelled examples</h4><div class="tblwrap"><table><thead><tr><th>Stock</th><th>Label</th><th>Text</th></tr></thead><tbody>'+
+      ex.map(e=>'<tr><td>'+esc(e.tk)+'</td><td>'+esc(e.stance)+(e.flags.length?'<br><span style="color:var(--faint)">'+esc(e.flags.filter(f=>f!=='about').join(', ')||'')+(e.flags.indexOf('about')<0?' not about company':'')+'</span>':'<br><span style="color:var(--faint)">not about company</span>')+'</td><td>'+esc(e.text)+'</td></tr>').join('')+'</tbody></table></div>';
+  }
+  html+='<h4>Timing</h4><ul><li>Windows follow the NYSE clock, not calendar dates: <b>day</b> = prior close to close; <b>overnight + pre-market</b> = prior close to the first regular-hours price; <b>regular</b> = that price to the close.</li>'+
+   '<li>Sentiment is always measured in a window that ends before the return window starts. A window needs at least '+P.min_n+' article with a stance.</li></ul>'+
    '<h4>Returns and controls</h4><ul><li>Log returns minus the average return of every other tracked stock over the same window (market-adjusted), with extreme values capped at the 0.5th / 99.5th percentile.</li>'+
-   '<li>Controls: the stock’s own return in the window just before (already known when the prediction is made) and its mention volume, plus stock fixed effects. Sentiment is standardised within each stock, because some stocks’ crowds are always more bullish than others.</li>'+
+   '<li>Controls: the stock’s own return in the window just before (already known when the prediction is made) and its article volume, plus stock fixed effects. Sentiment is standardised within each stock.</li>'+
    '<li>Earnings: trading days '+((P.earn_window||[-1,2])[0])+' to +'+((P.earn_window||[-1,2])[1])+' around each report are flagged, so every test can be run with them included, excluded, or alone.</li></ul>'+
    '<h4>Significance</h4><ul><li>Standard errors are clustered by date, because a market-wide story moves every stock on the same day.</li>'+
-   '<li>Robustness: the same regression on the first 70% and the last 30% of dates; a long-short check (each day, top fifth of stocks by sentiment minus bottom fifth); and for single stocks, a Benjamini-Hochberg false-discovery count at 10%, since 600+ stocks tested at p < 0.05 give about 30 “hits” by chance.</li></ul>'+
-   '<h4>Known limits</h4><ul><li>About five months of dense mention history; StockTwits is sampled at up to 20 posts an hour per stock, and news is thin for most stocks.</li>'+
-   '<li>The market adjustment uses this tracked universe, not an index, and does not adjust for sector.</li>'+
-   '<li>The open is the first regular-session hourly price (up to 90 minutes after 9:30), not the official opening auction.</li></ul>';
+   '<li>Robustness: the same regression on the first 70% and the last 30% of dates; a long-short check (each day, top fifth of stocks by news sentiment minus bottom fifth); and for single stocks, a Benjamini-Hochberg false-discovery count at 10%.</li></ul>'+
+   '<h4>Known limits</h4><ul><li>News is thin for most stocks: a few articles a day for the largest companies, often none for smaller ones.</li>'+
+   '<li>Yahoo publishes many articles after the move they describe; the price-move label removes the obvious recaps but not every late article.</li>'+
+   '<li>The market adjustment uses this tracked universe, not an index, and does not adjust for sector. The open is the first regular-session hourly price (up to 90 minutes after 9:30).</li></ul>';
+  $('methods').innerHTML=html;
 }
 document.querySelectorAll('#stScope button').forEach(b=>b.addEventListener('click',()=>{ study.scope=b.getAttribute('data-v'); drawStudy(); }));
 document.querySelectorAll('#stReg button').forEach(b=>b.addEventListener('click',()=>{ study.reg=b.getAttribute('data-v'); drawStudy(); }));
@@ -1032,7 +1042,7 @@ function drawLagBars(svgId,tipId,rows,unitLabel,lagName,leftLbl,rightLbl){
 }
 function ncdf(x){ const t=1/(1+0.2316419*x), d=0.3989423*Math.exp(-x*x/2); return 1-d*t*(0.3193815+t*(-0.3565638+t*(1.781478+t*(-1.821256+t*1.330274)))); }
 function drawStockLags(S){
-  const reg=$('earnReg').value, sc=view.scope, ll=S.ll||{};
+  const reg=$('earnReg').value, sc=view.lag, ll=S.ll||{};
   const daily=((ll.daily||{})[sc]||{})[reg], sess=((ll.sess||{})[sc]||{})[reg];
   drawLagBars('lag','ltip',daily,'trading days with both values',
     k=>k>0?'Sentiment, then the return '+k+' trading day'+(k>1?'s':'')+' later':k<0?'Return, then sentiment '+(-k)+' trading day'+(k<-1?'s':'')+' later':'Same trading day',
@@ -1050,11 +1060,11 @@ function drawStats(tk,a,scope){
   const r=k1.r, n=k1.n||0, p=k1.p;
   $('stats').innerHTML=
     '<div class="stat"><div class="k">Next-day correlation</div><div class="v">'+(r==null?'—':(r>=0?'+':'−')+Math.abs(r).toFixed(2))+'</div><small>'+(r==null?'not enough data':fmtP(p)+' · '+n+' days · '+(p!=null&&p<0.05?'outside':'inside')+' chance band')+'</small></div>'+
-    '<div class="stat"><div class="k">Mentions</div><div class="v">'+(v.n_m!=null?v.n_m.toLocaleString():(a.n_mentions||0))+'</div><small>'+(v.n_st!=null?v.n_st.toLocaleString()+' with a stance · ':'')+'social '+a.social_mentions+' · news '+a.news_mentions+'</small></div>'+
+    '<div class="stat"><div class="k">News articles</div><div class="v">'+(v.n_m!=null?v.n_m.toLocaleString():(a.news_mentions||0))+'</div><small>'+(v.n_st!=null?v.n_st.toLocaleString()+' with a stance':'')+'</small></div>'+
     '<div class="stat"><div class="k">Earnings reports</div><div class="v">'+(v.n_ev||0)+'</div><small>in the price history</small></div>';
-  $('catline').innerHTML='Category: <b>'+a.sector+'</b> · <b>'+a.industry+'</b> · <b>'+a.mcap_bucket+'-cap</b> · leans <b>'+a.source_favored+'</b>';
+  $('catline').innerHTML='Category: <b>'+a.sector+'</b> · <b>'+a.industry+'</b> · <b>'+a.mcap_bucket+'-cap</b>';
   const cav=$('caveat');
-  if(r!=null && n<40){ cav.style.display='block'; cav.innerHTML='Only '+n+' trading days with enough '+(scope==='both'?'':scope+' ')+'mentions for '+tk+': per-stock correlations this small-sample are <b>illustrative</b>. The study-wide results above pool every stock.'; }
+  if(r!=null && n<40){ cav.style.display='block'; cav.innerHTML='Only '+n+' trading days with news for '+tk+': per-stock correlations on samples this small are <b>illustrative</b>. The study-wide results above pool every stock.'; }
   else cav.style.display='none';
 }
 
@@ -1064,7 +1074,7 @@ function drawStats(tk,a,scope){
 const tkSel=$('tkSel'), srcSel=$('srcSel'), catSel=$('catSel'), catVal=$('catVal'), catValWrap=$('catValWrap');
 function catValue(tk,key){ return key==='all'?'all':(A[tk][key]||'unknown'); }
 function fillStocks(list){ tkSel.innerHTML=''; list.forEach(tk=>{ const o=document.createElement('option'); o.value=tk;
-  const v=A[tk].v2; o.textContent=tk+'  ('+((v&&v.n_m!=null)?v.n_m:A[tk].n_mentions).toLocaleString()+' mentions)'; tkSel.appendChild(o); }); }
+  const v=A[tk].v2; o.textContent=tk+'  ('+((v&&v.n_m!=null)?v.n_m:(A[tk].news_mentions||0)).toLocaleString()+' articles)'; tkSel.appendChild(o); }); }
 function populateStocks(){ const cat=catSel.value, f=catVal.value; const list=D.order.filter(tk=>cat==='all'||catValue(tk,cat)===f);
   fillStocks(list); if(list.length) render(list[0]); }
 function populateCatValues(){ const cat=catSel.value; if(cat==='all'){ catValWrap.style.display='none'; populateStocks(); return; }
@@ -1072,8 +1082,8 @@ function populateCatValues(){ const cat=catSel.value; if(cat==='all'){ catValWra
   vals.forEach(v=>{ const o=document.createElement('option'); o.value=v; o.textContent=v; catVal.appendChild(o); });
   catValWrap.style.display=''; populateStocks(); }
 function render(tk){
-  tkSel.value=tk; const a=A[tk]; let scope=srcSel.value; if(!(((a.scopes||{})[scope]||{}).n_mentions>0)) scope='both';
-  view.scope=scope; $('mentionsBtn').href='mentions.html?ticker='+encodeURIComponent(tk);
+  tkSel.value=tk; const a=A[tk]; view.lag=srcSel.value; const scope=view.lag;
+  $('mentionsBtn').href='mentions.html?ticker='+encodeURIComponent(tk);
   $('earnLegend').style.display=a.he?'inline':'none';
   drawStats(tk,a,scope); loadMain(tk);
 }

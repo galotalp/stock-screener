@@ -66,6 +66,11 @@ python3 analyze.py | head -1
 # embeds for the third plot ("was the move priced in after hours?"). Must run
 # AFTER analyze.py and BEFORE gen_analysis.py. Non-fatal if it fails.
 python3 analyze_sessions.py > /dev/null 2>&1 || echo "  (analyze_sessions failed — third plot may be stale)"
+# label new news items with Claude Haiku 5.5 (Message Batches) -> data/news_llm.jsonl.
+# Needs ANTHROPIC_API_KEY or ~/.anthropic_api_key and `pip install --user anthropic`;
+# without them it prints a note and the study uses word-list scores. Waits up to 20 min
+# for tonight's batch, otherwise it is collected on the next run. Never fails the run.
+python3 news_llm.py --wait 20 2>&1 | tail -3
 # v2 study (sentiment_v2 stance, NYSE-clock windows, market-adjusted returns,
 # pooled tests with earnings controls) -> data/analysis_v2.json, rendered by
 # gen_analysis.py. Read-only over the scraped data. Non-fatal.

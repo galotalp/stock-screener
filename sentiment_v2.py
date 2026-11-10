@@ -19,8 +19,37 @@ stance(m) -> (value, method)
           no stance, so it can't feed back into a price test) | "none"
 
 flags(m) -> {"earn": bool, "move": bool}
+
+news_stance(tk, m, fl) -> (value, method, label)
+  The dashboard and study use news only. Each news item's stance comes from its
+  Claude Haiku label in data/news_llm.jsonl (news_llm.py): bullish +1, bearish -1,
+  neutral 0; items the model marks as not about the company ("offtopic") or as a
+  price-move report ("move") carry no stance. Items not labeled yet fall back to
+  the word list below (method "lex"/"move"/"none"). `label` is the cached record
+  or None.
 """
+import json
+import os
 import re
+
+LLM_CACHE = "data/news_llm.jsonl"
+LLM_VAL = {"bullish": 1.0, "bearish": -1.0, "neutral": 0.0}
+_llm = None
+
+
+def llm_labels():
+    """{"TICKER|id": label} from the Haiku cache, loaded once per process."""
+    global _llm
+    if _llm is None:
+        _llm = {}
+        if os.path.exists(LLM_CACHE):
+            for line in open(LLM_CACHE, encoding="utf-8"):
+                try:
+                    r = json.loads(line)
+                    _llm[r["k"]] = r
+                except Exception:
+                    continue
+    return _llm
 
 # Loughran-McDonald-style finance polarity words, minus price-move verbs,
 # uncertainty words and neutral filler. Trading-action words (buy/sell) are a
@@ -124,6 +153,18 @@ def stance(m, fl=None):
     if pos + neg == 0:
         return None, "none"
     return (pos - neg) / (pos + neg), "lex"
+
+
+def news_stance(tk, m, fl=None):
+    r = llm_labels().get(f"{tk}|{m.get('id')}")
+    if r is not None:
+        if not r.get("about", True):
+            return None, "offtopic", r
+        if r.get("move"):
+            return None, "move", r
+        return LLM_VAL.get(r.get("stance"), 0.0), "llm", r
+    s, method = stance(m, fl)
+    return s, method, None
 
 
 if __name__ == "__main__":
