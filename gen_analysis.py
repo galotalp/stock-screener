@@ -1,33 +1,59 @@
 """
-Generate the Sentiment vs Price analysis page (self-contained, static).
+Generate the Sentiment vs Price dashboard (v2 chart).
 
-Chart design (per user spec):
-  - DUAL axis, honestly scaled: price on LEFT y-axis (its real $ range), sentiment
-    on RIGHT y-axis FIXED to its true -1..+1 range (not auto-hugged to price — this
-    prevents manufacturing visual correlation). X-axis = Date.
-  - ALL axes labelled: "Price ($)" left, "Sentiment (-1 to +1)" right, "Date" bottom.
-  - X-axis restricted to the sentiment window (±1 day), computed upstream in analyze.py.
-  - Source dropdown: Both / Social / News (Both default) — switches the sentiment series.
-  - Category filter: sector / market-cap bucket / source-favored, to slice the stock list.
-  - Separate lead/lag cross-correlation chart is the rigorous correlation measure.
+Outputs
+  analysis.html          the page. Embeds a small index payload: per-stock summary
+                         and lead/lag results, earnings events, pipeline freshness,
+                         and one shared half-hour time grid.
+  series/<TICKER>.json   per-stock chart data (hourly prices + half-hour mention
+                         sums), fetched by the page when that stock is selected.
+                         Publish this folder next to index.html (run_scrape.sh).
 
-Matches galavgay.com styling. Two-series palette validated (price #3b5bdb, senti #0ca678).
+Chart model
+  - Time axis: one half-hour grid in US/Eastern time shared by every stock. Each
+    slot carries its market session from market_session.session_of(), so the page
+    uses exactly the same session labels as the mention store. Pre-market, regular
+    and after-hours slots get equal width; every closed run (overnight, weekend,
+    holiday) is collapsed client-side to one fixed-width marked break.
+  - Price: hourly bars from data/prices/<T>_intraday.json, placed at their slot.
+  - Sentiment: per slot, the mean stance and count of mentions that carry one
+    (sentiment_v2.stance: StockTwits Bullish/Bearish tag, else a cleaned finance
+    lexicon; news that only reports a price move and text with no hits have no
+    stance), plus the count of all mentions. Kept separately for social and news
+    so the source control can recombine them. The page draws a
+    time-decayed level: sum(w*score)/sum(w) with w = 0.5^(age/half-life), so the
+    half-life (6h or 14d) is real clock time, the level holds through quiet spells,
+    and it is hidden once the decayed evidence falls below MIN_WEIGHT mentions.
+    Mentions before the grid start seed that level (the "init" block).
+  - Study-wide results, per-stock lead/lag and session lead/lag come from
+    data/analysis_v2.json (analyze_v2.py). data/analysis.json (analyze.py) still
+    supplies the stock list, sector/industry/cap categories and mention counts.
+
+The previous single-file generator is kept as gen_analysis_v1.py.
 """
-import json
-import os
+import datetime as dt
 import glob
-
+import json
 import math
+import os
+import shutil
 
-# session -> single-char code for compact embedding
+import sentiment_v2 as sv
+
+SLOT = 1800                      # half-hour slots, seconds
+FAST_HL_SLOTS = 12               # 6 hours
+SLOW_HL_SLOTS = 14 * 48          # 14 days
+SERIES_DIR = "series"
+
+# session -> single-char code (same codes as v1)
 SESS_CODE = {"pre_market": "p", "regular": "r", "after_hours": "a",
-             "overnight": "o", "weekend": "w", "holiday": "h", None: "?"}
+             "overnight": "o", "weekend": "w", "holiday": "h"}
+# time-of-day index 0..47 (half hours) -> one character
+TOD_CH = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKL"
 
 
 def _json_safe(obj):
-    """Recursively replace NaN/Inf floats with None so the embedded payload is
-    strict-valid JSON (browser JSON.parse rejects NaN/Infinity). Everything else
-    passes through unchanged."""
+    """Replace NaN/Inf with None so the output is strict JSON (browsers reject NaN)."""
     if isinstance(obj, float):
         return None if (math.isnan(obj) or math.isinf(obj)) else obj
     if isinstance(obj, dict):
@@ -37,78 +63,174 @@ def _json_safe(obj):
     return obj
 
 
-def load_intraday_compact(ticker):
-    """Compact intraday series for embedding: parallel arrays keyed off a base epoch.
-    Returns {t:[unix_seconds...], p:[price...], s:"codes..."} or None."""
-    p = f"data/prices/{ticker}_intraday.json"
-    if not os.path.exists(p):
-        return None
-    import datetime as dt
+def _epoch(iso):
     try:
-        bars = json.load(open(p))
+        return int(dt.datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp())
     except Exception:
         return None
-    if not bars:
-        return None
-    ts, pr, sc = [], [], []
-    for b in bars:
+
+
+def _family(src):
+    """news:* -> news; stocktwits/reddit/unknown -> social (as analyze.py)."""
+    return "news" if (src or "").lower().startswith("news") else "social"
+
+
+# --------------------------------------------------------------------------
+# shared time grid
+# --------------------------------------------------------------------------
+def intraday_span(tickers):
+    """(first, last) unix second across all intraday price stores."""
+    lo = hi = None
+    for tk in tickers:
+        p = f"data/prices/{tk}_intraday.json"
+        if not os.path.exists(p):
+            continue
         try:
-            u = int(dt.datetime.fromisoformat(b["ts"].replace("Z", "+00:00")).timestamp())
+            bars = json.load(open(p))
         except Exception:
             continue
-        if b.get("price") is None:
-            continue
-        ts.append(u)
-        pr.append(round(float(b["price"]), 2))
-        sc.append(SESS_CODE.get(b.get("session"), "?"))
-    if not ts:
-        return None
-    return {"t": ts, "p": pr, "s": "".join(sc)}
+        for b in (bars[0], bars[-1]) if bars else ():
+            u = _epoch(b.get("ts", ""))
+            if u is None:
+                continue
+            lo = u if lo is None else min(lo, u)
+            hi = u if hi is None else max(hi, u)
+    return lo, hi
 
 
-def build_nyse_schedule(intraday):
-    """Compact NYSE schedule for the date span the intraday data covers, so the
-    browser can classify EVERY hour of the x-axis (not only hours that have a
-    price bar) exactly the way market_session.py does. Weekends and holidays are
-    simply the dates ABSENT from this map; early-close days carry their real
-    (open,close). Returns {"YYYY-MM-DD":[open_unix, close_unix], ...}.
+def build_grid(t_lo, t_hi):
+    """Half-hour grid from ET midnight of t_lo's date through t_hi.
 
-    The client-side sessionAt() mirrors session_of(): a timestamp on a date in
-    this map is pre/regular/after by its open/close; a date NOT in the map is
-    weekend (Sat/Sun) or holiday (weekday); 20:00->04:00 between two trading days
-    is overnight. So the ONE authoritative input the browser needs is this set of
-    trading days with their exact open/close, which is what we export here."""
-    import datetime as dt
-    try:
-        import market_session as ms
-    except Exception:
-        return {}
-    # date span = min..max across all embedded intraday series (+/- a day of pad)
-    lo = hi = None
-    for c in intraday.values():
-        if not c.get("t"):
-            continue
-        t0, t1 = c["t"][0], c["t"][-1]
-        lo = t0 if lo is None else min(lo, t0)
-        hi = t1 if hi is None else max(hi, t1)
-    if lo is None:
-        return {}
-    d0 = dt.datetime.fromtimestamp(lo, dt.timezone.utc).date() - dt.timedelta(days=2)
-    d1 = dt.datetime.fromtimestamp(hi, dt.timezone.utc).date() + dt.timedelta(days=2)
-    out = {}
-    for yr in range(d0.year, d1.year + 1):
-        sched = ms._schedule_for_year(yr)  # {date: (open_utc, close_utc)}
-        for day, (o_utc, c_utc) in sched.items():
-            if d0 <= day <= d1:
-                out[day.isoformat()] = [int(o_utc.timestamp()), int(c_utc.timestamp())]
+    Returns {start, n, c, tod, days}: c = one session code per slot, tod = one
+    TOD_CH character per slot (ET wall-clock half hour), days = [[slot, label]]
+    at each ET midnight."""
+    import market_session as ms
+    from zoneinfo import ZoneInfo
+    et_tz = ZoneInfo("America/New_York")
+    d0 = dt.datetime.fromtimestamp(t_lo, et_tz).date()
+    start = int(dt.datetime(d0.year, d0.month, d0.day, tzinfo=et_tz).timestamp())
+    n = max(1, (t_hi - start) // SLOT + 1)
+    codes, tods, days, last = [], [], [], None
+    for k in range(n):
+        utc = dt.datetime.fromtimestamp(start + k * SLOT, dt.timezone.utc)
+        codes.append(SESS_CODE.get(ms.session_of(utc), "?"))
+        et = utc.astimezone(et_tz)
+        tods.append(TOD_CH[(et.hour * 60 + et.minute) // 30])
+        if et.date() != last:
+            days.append([k, et.strftime("%a %b ") + str(et.day)])
+            last = et.date()
+    return {"start": start, "n": n, "c": "".join(codes), "tod": "".join(tods),
+            "days": days}
+
+
+# --------------------------------------------------------------------------
+# per-stock series
+# --------------------------------------------------------------------------
+def _decayed(slots, hl, until):
+    """Decayed (S, W) after the given {slot: [sum, count]} items, aged to `until`."""
+    S = W = 0.0
+    prev = None
+    for k in sorted(slots):
+        if prev is not None:
+            f = 0.5 ** ((k - prev) / hl)
+            S *= f
+            W *= f
+        s, c = slots[k]
+        S += s
+        W += c
+        prev = k
+    if prev is not None:
+        f = 0.5 ** ((until - prev) / hl)
+        S *= f
+        W *= f
+    return [round(S, 6), round(W, 6)]
+
+
+def _delta(ks):
+    out, prev = [], 0
+    for k in ks:
+        out.append(k - prev)
+        prev = k
     return out
 
 
+def build_series(tk, grid):
+    start, n = grid["start"], grid["n"]
+    # ---- prices: one hourly bar per slot (last write wins) ----
+    price = {}
+    p = f"data/prices/{tk}_intraday.json"
+    if os.path.exists(p):
+        try:
+            for b in json.load(open(p)):
+                u = _epoch(b.get("ts", ""))
+                v = b.get("price")
+                if u is None or not isinstance(v, (int, float)) or math.isnan(v):
+                    continue
+                k = (u - start) // SLOT
+                if 0 <= k < n:
+                    price[k] = round(float(v), 2)
+        except Exception:
+            pass
+    # ---- mentions: per family, per slot [sum, count]; pre-grid kept for init ----
+    acc = {"social": {}, "news": {}}
+    pre = {"social": {}, "news": {}}
+    p = f"data/mentions/{tk}.jsonl"
+    if os.path.exists(p):
+        for line in open(p, encoding="utf-8"):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                m = json.loads(line)
+            except Exception:
+                continue
+            u = _epoch(m.get("date") or "")
+            if u is None:
+                continue
+            k = (u - start) // SLOT
+            if k >= n:
+                continue
+            s, _ = sv.stance(m)
+            tgt = (acc if k >= 0 else pre)[_family(m.get("source"))]
+            cell = tgt.setdefault(k, [0.0, 0, 0])   # stance sum, stanced count, all mentions
+            cell[2] += 1
+            if s is not None:
+                cell[0] += s
+                cell[1] += 1
+    used = list(price) + [k for f in acc.values() for k in f]
+    if not used:
+        return None
+    out = {"t": tk, "i0": min(used), "i1": n - 1}
+    pk = sorted(price)
+    out["p"] = _delta(pk)
+    out["pv"] = [price[k] for k in pk]
+    out["m"] = {}
+    for fam, slots in acc.items():
+        ks = sorted(slots)
+        out["m"][fam] = [_delta(ks),
+                         [round(1000 * slots[k][0] / slots[k][1]) if slots[k][1] else 0 for k in ks],
+                         [slots[k][1] for k in ks],
+                         [slots[k][2] for k in ks]]
+    both_pre = {}
+    for fam in pre.values():
+        for k, (s, c, _) in fam.items():
+            if c:
+                cell = both_pre.setdefault(k, [0.0, 0])
+                cell[0] += s
+                cell[1] += c
+    out["init"] = {}
+    for scope, slots in (("both", both_pre), ("social", pre["social"]), ("news", pre["news"])):
+        sl = {k: v[:2] for k, v in slots.items() if v[1]}
+        out["init"][scope] = {"f": _decayed(sl, FAST_HL_SLOTS, -1),
+                              "s": _decayed(sl, SLOW_HL_SLOTS, -1)}
+    return out
+
+
+# --------------------------------------------------------------------------
+# index payload pieces (unchanged from v1 where noted)
+# --------------------------------------------------------------------------
 def load_earnings_compact(tickers):
-    """Per-ticker earnings events for the chart's vertical markers + hover.
-    Returns {ticker: [{t:unix, sess, we:unix|None, est, rep, surp}, ...]} — only for
-    tickers that have an earnings file. Compact keys keep the payload small."""
-    import datetime as dt
+    """{ticker: [{t, sess, we, est, rep, surp}]} for markers, hover and the regime control."""
     out = {}
     for tk in tickers:
         p = f"data/earnings/{tk}.json"
@@ -120,33 +242,20 @@ def load_earnings_compact(tickers):
             continue
         evs = []
         for e in data.get("events", []):
-            ts = e.get("ts")
-            if not ts:
+            u = _epoch(e.get("ts") or "")
+            if u is None:
                 continue
-            try:
-                u = int(dt.datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp())
-            except Exception:
-                continue
-            we = e.get("window_end")
-            try:
-                weu = int(dt.datetime.fromisoformat(we.replace("Z", "+00:00")).timestamp()) if we else None
-            except Exception:
-                weu = None
-            evs.append({
-                "t": u,
-                "sess": e.get("session"),
-                "we": weu,
-                "est": e.get("eps_estimate"),
-                "rep": e.get("reported_eps"),
-                "surp": e.get("surprise_pct"),
-            })
+            evs.append({"t": u, "sess": e.get("session"),
+                        "we": _epoch(e["window_end"]) if e.get("window_end") else None,
+                        "est": e.get("eps_estimate"), "rep": e.get("reported_eps"),
+                        "surp": e.get("surprise_pct")})
         if evs:
             out[tk] = evs
     return out
 
 
 def load_mcaps():
-    """Raw market cap per ticker from lynch.csv (for ordering biggest-first)."""
+    """Raw market cap per ticker from lynch.csv (dropdown order, biggest first)."""
     import csv
     out = {}
     p = "data/lynch.csv"
@@ -161,26 +270,11 @@ def load_mcaps():
 
 
 def build_freshness():
-    """Pipeline health, embedded in the page so staleness is VISIBLE to a reader.
-
-    Why this exists: in late July 2026 the nightly run began exceeding daily-run.sh's
-    timeout (serial per-ticker rate-limit sleeps grow with the universe), so it was
-    killed after collecting but before publishing. The dashboard silently served a
-    12-day-old page — nothing on it said so, and the failure was only noticed by
-    eyeballing the charts. A generated-at stamp plus the newest date actually present
-    in the data makes that failure mode self-announcing.
-
-    Returns {gen: unix, mentions_max: "YYYY-MM-DD"|None, price_max: "YYYY-MM-DD"|None,
-             n_tickers: int}. The client turns this into an age and a banner.
-    """
-    import datetime as dt
+    """Generated-at stamp + newest mention date, so a stale page announces itself
+    (see v1 for the incident that motivated this)."""
     now = int(dt.datetime.now(dt.timezone.utc).timestamp())
     out = {"gen": now, "mentions_max": None, "price_max": None, "n_tickers": 0}
-    # Newest mention date across the store. Records carry an ISO "date" field
-    # (e.g. "2026-07-10T23:51:52Z"). Appends are roughly chronological but not
-    # guaranteed sorted, so scan the tail of each file (not just the final line)
-    # and keep the max — reading ~32 KB per ticker instead of the whole 117 MB store.
-    newest_m = None
+    newest = None
     for p in glob.glob("data/mentions/*.jsonl"):
         try:
             with open(p, "rb") as fh:
@@ -188,191 +282,212 @@ def build_freshness():
                 size = fh.tell()
                 fh.seek(max(0, size - 32768))
                 tail = fh.read().decode("utf-8", "ignore").splitlines()
-            # drop a possibly-truncated first line from the mid-file seek
             if size > 32768 and tail:
                 tail = tail[1:]
             for line in tail:
-                line = line.strip()
-                if not line:
-                    continue
                 try:
                     d = (json.loads(line).get("date") or "")[:10]
                 except Exception:
                     continue
-                if len(d) == 10 and (newest_m is None or d > newest_m):
-                    newest_m = d
+                if len(d) == 10 and (newest is None or d > newest):
+                    newest = d
         except Exception:
             continue
-    out["mentions_max"] = newest_m
+    out["mentions_max"] = newest
     return out
+
+
+SUMMARY_KEYS = ("n_mentions", "sector", "industry", "mcap_bucket",
+                "source_favored", "social_mentions", "news_mentions")
+SCOPE_MENTIONS = "n_mentions"
 
 
 def main():
     analysis = json.load(open("data/analysis.json"))
     mcaps = load_mcaps()
-    # attach raw mcap to each ticker (for the client) + order the dropdown by it,
-    # biggest first (NVDA, AAPL, MSFT, ...). Unknown-cap names sink to the bottom.
-    for tk in analysis:
-        analysis[tk]["market_cap"] = mcaps.get(tk, 0)
-    order = sorted(analysis.keys(),
-                   key=lambda t: mcaps.get(t, 0), reverse=True)
-    # attach compact intraday series so the chart can zoom into session-shaded hours
-    intraday = {}
-    for tk in analysis:
-        c = load_intraday_compact(tk)
-        if c:
-            intraday[tk] = c
-    # session-aware lead/lag analysis (full extended-hours path vs regular-only path)
-    session = {}
-    if os.path.exists("data/session_analysis.json"):
-        session = json.load(open("data/session_analysis.json"))
-    # NYSE trading-day schedule so the browser can classify every hour of the
-    # x-axis (weekend/holiday/overnight bands, not just hours with a price bar).
-    nyse = build_nyse_schedule(intraday)
-    # earnings events per ticker (vertical markers + hover + regime control)
-    earnings = load_earnings_compact(list(analysis.keys()))
-    payload = {"analysis": analysis, "order": order, "intraday": intraday,
-               "session": session, "nyse": nyse, "earnings": earnings}
-    # pipeline-health block (see build_freshness): newest price date comes from the
-    # analysis we already hold, so it costs nothing to add here.
+    order = sorted(analysis, key=lambda t: mcaps.get(t, 0), reverse=True)
+    t_lo, t_hi = intraday_span(order)
+    now = int(dt.datetime.now(dt.timezone.utc).timestamp())
+    if t_lo is None:
+        t_lo = now - 30 * 86400
+    grid = build_grid(t_lo, max(now, t_hi or now))
+
+    v2 = None
+    if os.path.exists("data/analysis_v2.json"):
+        try:
+            v2 = json.load(open("data/analysis_v2.json"))
+        except Exception:
+            v2 = None
+    per = (v2 or {}).pop("stocks", {}) if v2 else {}
+    earnings = load_earnings_compact(order)
+
+    # Per-stock files carry everything only the selected stock needs (chart data,
+    # lead/lag curves, session analysis, earnings); the page embeds just the summary
+    # used by the dropdown, filters and stat tiles.
+    tmp = SERIES_DIR + ".tmp"
+    shutil.rmtree(tmp, ignore_errors=True)
+    os.makedirs(tmp)
+    summary, kept = {}, []
+    price_max = None
+    for tk in order:
+        s = build_series(tk, grid)
+        if s is None:
+            continue
+        a = analysis[tk]
+        scopes = a.get("scopes") or {}
+        pv = per.get(tk) or {}
+        s["ll"] = {"daily": pv.get("daily"), "sess": pv.get("sess")}
+        s["earn"] = earnings.get(tk, [])
+        with open(f"{tmp}/{tk}.json", "w") as fh:
+            json.dump(_json_safe(s), fh, separators=(",", ":"), allow_nan=False)
+        row = {k: a.get(k) for k in SUMMARY_KEYS}
+        row["market_cap"] = mcaps.get(tk, 0)
+        row["he"] = bool(s["earn"])
+        row["scopes"] = {sc: {"n_mentions": v.get(SCOPE_MENTIONS)} for sc, v in scopes.items()}
+        row["v2"] = {"n_m": pv.get("n_m"), "n_st": pv.get("n_st"), "n_ev": pv.get("n_ev"),
+                     "k1": pv.get("k1")} if pv else None
+        summary[tk] = row
+        kept.append(tk)
+        if s["p"]:
+            last = grid["start"] + sum(s["p"]) * SLOT
+            price_max = last if price_max is None else max(price_max, last)
+    shutil.rmtree(SERIES_DIR, ignore_errors=True)
+    os.rename(tmp, SERIES_DIR)
+
     fresh = build_freshness()
-    fresh["n_tickers"] = len(analysis)
-    pmax = None
-    for a in analysis.values():
-        ds = a.get("dates") or []
-        pr = a.get("price") or []
-        for i in range(len(ds) - 1, -1, -1):
-            if i < len(pr) and pr[i] is not None:
-                if pmax is None or ds[i] > pmax:
-                    pmax = ds[i]
-                break
-    fresh["price_max"] = pmax
-    payload["freshness"] = fresh
-    # CRITICAL: yfinance can leave NaN in a price series. Python's json.dumps emits a
-    # bare `NaN` token, which is NOT valid JSON — the browser's JSON.parse then throws
-    # and the ENTIRE dashboard fails to render (blank dropdown + blank charts). Scrub
-    # every NaN/Inf to null so the embedded payload is always strict-valid JSON; the
-    # chart already skips null price points. allow_nan=False is the belt-and-braces
-    # tripwire: if anything slips past the scrub it raises here (a loud generator
-    # error) instead of silently shipping a broken page.
+    fresh["n_tickers"] = len(kept)
+    if price_max is not None:
+        fresh["price_max"] = dt.datetime.fromtimestamp(price_max, dt.timezone.utc).date().isoformat()
+    payload = {"analysis": summary, "order": kept, "grid": grid,
+               "freshness": fresh, "series": SERIES_DIR + "/", "study": v2}
     payload = _json_safe(payload)
     data_js = json.dumps(payload, separators=(",", ":"), allow_nan=False)
-    html = TEMPLATE.replace("/*DATA*/", data_js)
-    out = f'''<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Sentiment vs Price · Gal Av-Gay</title>
-</head>
-<body>
-{html}
-</body>
-</html>
-'''
+    html = TEMPLATE.replace("/*DATA*/", data_js.replace("</", "<\\/"))
+    out = ('<!DOCTYPE html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n'
+           '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
+           '<title>Sentiment vs Price · Gal Av-Gay</title>\n</head>\n<body>\n'
+           + html + '\n</body>\n</html>\n')
     open("analysis.html", "w", encoding="utf-8").write(out)
-    print("wrote analysis.html", len(out), "bytes;", len(analysis), "tickers")
+    print(f"wrote analysis.html {len(out)} bytes; {len(kept)} tickers; "
+          f"{SERIES_DIR}/ {len(kept)} files; grid {grid['n']} slots")
 
 
 TEMPLATE = r"""
 <style>
+  /* Dark theme. Series steps are the dark-surface steps of the reference palette
+     (validated: lightness band, chroma, CVD and contrast on #1a1a19). */
   :root{
-    --bg:#ffffff; --ink:#333; --body:#696969; --faint:#8a8a8a;
-    --navy:#00008b; --link:#597ccd; --link-hover:#00008b;
-    --hair:#e6e6e6; --hair2:#f0f0f0; --panel:#fafafb;
-    --price:#3b5bdb; --senti:#0ca678; --vol:#c9ced8;
-    --pos:#1a7f37; --neg:#c0392b;
-    /* Times New Roman throughout, matching the research proposal */
+    color-scheme:dark;
+    --bg:#121211; --surface:#1a1a19; --panel:#1f1f1d; --raise:#262624;
+    --ink:#f0efec; --body:#c3c2b7; --faint:#898781;
+    --hair:#383835; --hair2:#2a2a28; --rib-r:#33332f; --rib-x:#2a2a27; --rib-c:#40403b;
+    --link:#7aa7ef; --link-hover:#a9c6f5; --accent:#7aa7ef;
+    --price:#3987e5; --senti:#d95926; --muted-mark:#5d5c57;
+    --good:#0ca30c; --warn:#fab219; --crit:#d03b3b; --earn:#c9a227;
     --serif:"Times New Roman",Times,Georgia,serif;
-    --sans:"Times New Roman",Times,Georgia,serif; --head:"Times New Roman",Times,Georgia,serif;
-    --mono:"Times New Roman",Times,Georgia,serif;
+    --ui:system-ui,-apple-system,"Segoe UI",sans-serif;
   }
   *{box-sizing:border-box;}
-  html,body{overflow-x:hidden;}
-  body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--serif);font-size:17px;line-height:1.55;padding:3px;}
+  html,body{overflow-x:hidden;background:var(--bg);}
+  body{margin:0;color:var(--ink);font-family:var(--serif);font-size:17px;line-height:1.55;padding:3px;}
   .wrap{max-width:1080px;margin:0 auto;padding:0 32px 80px;width:100%;}
   a{color:var(--link);text-decoration:none;} a:hover{color:var(--link-hover);text-decoration:underline;}
   .topbar{display:flex;align-items:center;gap:18px;flex-wrap:wrap;padding:16px 0 0;font-size:14px;}
   .topbar .home{font-weight:bold;}
-  h1{font-family:var(--head);color:#000;font-size:30px;font-weight:bold;border-bottom:3px solid var(--navy);padding:0 0 6px;margin:18px 0 14px;text-align:center;}
-  .intro{font-size:16px;color:var(--body);margin:0 auto 10px;max-width:none;line-height:1.6;text-align:justify;}
-  .intro.lead{font-size:17px;color:var(--ink);}
+  h1{color:var(--ink);font-size:30px;font-weight:bold;border-bottom:3px solid var(--accent);padding:0 0 6px;margin:18px 0 14px;text-align:center;}
+  h2{font-size:22px;color:var(--ink);margin:34px 0 10px;text-align:center;}
+  h3{font-size:17px;color:var(--ink);margin:0 0 6px;font-family:var(--ui);}
+  .intro{font-size:17px;color:var(--body);margin:0 auto 14px;line-height:1.6;text-align:justify;}
   .intro b{color:var(--ink);}
-  /* earnings tooltip text (drawn panel, see showEarnTip) */
-  .earntiptxt{fill:#fff;font-family:var(--sans);}
-  /* pipeline freshness banner — green/amber/red by data age (see updateFreshness) */
-  .freshbar{font-family:var(--sans);font-size:14px;margin:0 0 14px;padding:10px 14px;
-            border-radius:8px;border:1px solid var(--hair);background:var(--panel);
-            display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;}
+  .freshbar{font-family:var(--ui);font-size:14px;margin:0 0 14px;padding:10px 14px;border-radius:8px;border:1px solid var(--hair);
+            background:var(--panel);display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;}
   .freshbar .dot{width:9px;height:9px;border-radius:50%;flex:none;align-self:center;}
-  .freshbar .msg{font-weight:bold;}
-  .freshbar .detail{color:var(--faint);font-size:13px;}
-  .freshbar.ok{border-color:#cfe8d5;background:#f4fbf6;}
-  .freshbar.ok .dot{background:var(--pos);} .freshbar.ok .msg{color:var(--pos);}
-  .freshbar.warn{border-color:#f0dfae;background:#fdf9ee;}
-  .freshbar.warn .dot{background:#b7791f;} .freshbar.warn .msg{color:#8a5a00;}
-  .freshbar.bad{border-color:#eebfb8;background:#fdf3f1;}
-  .freshbar.bad .dot{background:var(--neg);} .freshbar.bad .msg{color:var(--neg);}
-  .howto{font-size:15px;color:var(--body);margin:0 0 16px;line-height:1.6;text-align:justify;
-         background:var(--panel);border:1px solid var(--hair);border-radius:8px;padding:14px 18px;}
-  .howto b{color:var(--ink);} .howto .pos{color:var(--pos);font-weight:bold;} .howto .neg{color:var(--neg);font-weight:bold;}
-  .controls{display:flex;gap:16px;flex-wrap:wrap;align-items:end;justify-content:center;margin:0 0 8px;padding:14px 18px;background:var(--panel);border:1px solid var(--hair);border-radius:8px;}
+  .freshbar .msg{font-weight:bold;} .freshbar .detail{color:var(--faint);font-size:13px;}
+  .freshbar.ok .dot{background:var(--good);} .freshbar.ok .msg{color:var(--ink);}
+  .freshbar.warn{border-color:#5c4a1c;} .freshbar.warn .dot{background:var(--warn);} .freshbar.warn .msg{color:var(--warn);}
+  .freshbar.bad{border-color:#5c2626;} .freshbar.bad .dot{background:var(--crit);} .freshbar.bad .msg{color:#f08a8a;}
+  .howto{font-size:15px;color:var(--body);margin:0 0 16px;line-height:1.6;text-align:justify;background:var(--panel);
+         border:1px solid var(--hair);border-radius:8px;padding:14px 18px;}
+  .howto b{color:var(--ink);}
+  .controls{display:flex;gap:16px;flex-wrap:wrap;align-items:end;justify-content:center;margin:0 0 8px;padding:14px 18px;
+            background:var(--panel);border:1px solid var(--hair);border-radius:8px;}
   .fld{display:flex;flex-direction:column;gap:4px;}
-  .fld label{font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--faint);font-family:var(--head);font-weight:bold;}
-  select{font-family:var(--sans);font-size:15px;color:var(--ink);background:#fff;border:1px solid var(--hair);border-radius:5px;padding:8px 12px;}
+  .fld label{font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--faint);font-weight:bold;font-family:var(--ui);}
+  select{font-family:var(--ui);font-size:15px;color:var(--ink);background:var(--raise);border:1px solid var(--hair);border-radius:5px;padding:8px 12px;}
   select:focus{outline:2px solid var(--link);border-color:var(--link);}
-  .mentionsbtn{font-family:var(--sans);font-size:14px;font-weight:bold;color:var(--link);background:#fff;
-    border:1px solid var(--hair);border-radius:5px;padding:8px 14px;text-decoration:none;white-space:nowrap;}
-  .mentionsbtn:hover{border-color:var(--link);text-decoration:none;background:#f6f8ff;}
-
-  .statrow{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin:16px 0 12px;}
-  .stat{border:1px solid var(--hair);border-radius:6px;padding:11px 14px;background:#fff;}
-  .stat .k{font-size:11.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--faint);font-family:var(--head);font-weight:bold;}
-  .stat .v{font-family:var(--mono);font-size:21px;font-weight:bold;color:var(--ink);margin-top:3px;}
-  .stat .v.lead{color:var(--pos);} .stat .v.lag{color:var(--navy);}
-  .stat small{font-size:12.5px;color:var(--faint);font-family:var(--sans);font-weight:normal;display:block;margin-top:2px;}
-  .catrow{font-size:14px;color:var(--faint);font-family:var(--mono);margin:-2px 0 12px;text-align:center;}
-  .catrow b{color:var(--ink);}
-
-  .legend{display:flex;gap:24px;flex-wrap:wrap;font-size:16px;margin:8px 0 8px;justify-content:center;align-items:center;}
-  .legend span{display:inline-flex;align-items:center;gap:9px;}
-  .zoombar{display:flex;align-items:center;justify-content:center;gap:14px;margin:2px 0 4px;}
-  .zoomhint{font-size:13px;color:var(--faint);font-style:italic;}
-  .zoomreset{font-family:var(--sans);font-size:13px;color:var(--link);background:#fff;border:1px solid var(--hair);border-radius:5px;padding:5px 12px;cursor:pointer;}
-  .zoomreset:hover{border-color:var(--link);}
-  .sesslegend{gap:18px;font-size:15px;margin:2px 0 6px;}
-  .sesslegend i{width:26px;height:16px;border-radius:3px;display:inline-block;}
-  .sessverdict{background:var(--panel);border:1px solid var(--hair);border-left:3px solid var(--navy);border-radius:6px;
-     padding:12px 16px;font-size:15px;line-height:1.55;margin:8px 0 10px;text-align:justify;}
-  .sessverdict b{color:var(--ink);} .sessverdict .tag{font-weight:bold;}
-  .sessverdict .lead-tag{color:var(--pos);} .sessverdict .coincide-tag{color:var(--neut,#9a7a12);} .sessverdict .lag-tag{color:var(--neg);}
-  .legend span{display:inline-flex;align-items:center;gap:6px;}
-  .legend i{width:26px;height:6px;border-radius:3px;display:inline-block;}
-  .chartwrap{border:1px solid var(--hair);border-radius:8px;padding:10px 6px 4px;background:#fff;overflow-x:auto;}
-  svg{display:block;width:100%;height:auto;font-family:var(--mono);}
-  .axislbl{fill:var(--faint);font-size:12px;}
-  .leglbl{fill:var(--ink);font-size:14px;font-weight:bold;}
-  .axistitle{fill:var(--ink);font-size:13px;font-family:var(--head);font-weight:bold;}
-  .gridln{stroke:var(--hair2);stroke-width:1;} .zeroln{stroke:var(--hair);stroke-width:1;stroke-dasharray:3 3;}
-  .earnline{stroke:#b58900;stroke-width:1.3;stroke-dasharray:4 3;opacity:0.75;}
-  .earntag{fill:#b58900;} .earntaglbl{fill:#fff;font-size:10px;font-weight:bold;}
-  .earnmark{cursor:help;} .earnmark:hover .earnline{opacity:1;stroke-width:2;}
-  h3{font-family:var(--head);font-size:18px;color:#000;margin:26px 0 6px;text-align:center;}
-  .note{font-size:14px;color:var(--body);margin-top:10px;line-height:1.6;text-align:justify;}
-  .lagbar.pos{fill:var(--pos);} .lagbar.neg{fill:var(--neg);}
-  .caveat{background:#fff8e6;border:1px solid #f0e0b0;border-radius:6px;padding:11px 14px;font-size:14px;color:#7a6318;margin:12px 0;text-align:center;}
+  .mentionsbtn{font-family:var(--ui);font-size:14px;font-weight:bold;color:var(--link);background:var(--raise);border:1px solid var(--hair);
+               border-radius:5px;padding:8px 14px;white-space:nowrap;}
+  .mentionsbtn:hover{border-color:var(--link);text-decoration:none;}
+  .statrow{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin:16px 0 12px;font-family:var(--ui);}
+  .stat{border:1px solid var(--hair);border-radius:8px;padding:11px 14px;background:var(--surface);}
+  .stat .k{font-size:11.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--faint);font-weight:bold;}
+  .stat .v{font-size:21px;font-weight:600;color:var(--ink);margin-top:3px;}
+  .stat small{font-size:12.5px;color:var(--faint);font-weight:normal;display:block;margin-top:2px;}
+  .catrow{font-size:14px;color:var(--faint);margin:-2px 0 12px;text-align:center;font-family:var(--ui);} .catrow b{color:var(--body);}
+  .caveat{background:#2a2414;border:1px solid #5c4a1c;border-radius:6px;padding:11px 14px;font-size:14px;color:#e8cf8a;margin:12px 0;text-align:center;font-family:var(--ui);}
   footer{margin-top:40px;border-top:1px solid var(--hair);padding-top:18px;color:var(--faint);font-size:13px;line-height:1.6;text-align:center;}
-  @media(max-width:760px){
-    .controls{gap:10px;}
-    .wrap{padding:0 12px 70px;}
-    /* On phones a 1000-wide chart squashed into ~360px makes labels unreadable.
-       Give the charts a minimum width and let the wrapper scroll horizontally, so
-       the chart stays legible at full size instead of shrinking to nothing. */
-    .chartwrap{width:100%;max-width:100%;}
-    /* Charts scale to fit the phone; bump the in-SVG font sizes (which scale with the
-       viewBox) so axis labels stay readable at small sizes instead of shrinking away. */
-    .axislbl{font-size:19px;} .axistitle{font-size:21px;} .leglbl{font-size:22px;}
-  }
+
+  .card{border:1px solid var(--hair);border-radius:12px;padding:16px 18px;margin:0 0 16px;background:var(--surface);font-family:var(--ui);font-size:14px;color:var(--body);}
+  .card p{margin:0 0 8px;line-height:1.55;}
+  .vcontrols{display:flex;flex-wrap:wrap;align-items:center;margin-bottom:12px;}
+  .vcontrols .grp{display:inline-flex;align-items:center;margin:0 22px 8px 0;}
+  .vcontrols .grp > span{margin-right:8px;font-size:13px;color:var(--body);}
+  .seg{display:inline-flex;border-radius:7px;overflow:hidden;border:1px solid var(--hair);}
+  .seg button{font:inherit;font-size:13px;padding:5px 12px;border:0;cursor:pointer;background:transparent;color:var(--body);}
+  .seg button.on{font-weight:600;background:#3a3a36;color:var(--ink);}
+  .seg button:focus-visible,.zreset:focus-visible{outline:2px solid var(--link);outline-offset:1px;}
+  .zreset{font:inherit;font-size:13px;padding:5px 12px;border:1px solid var(--hair);border-radius:7px;background:var(--raise);color:var(--body);cursor:pointer;}
+  .vstats{display:flex;flex-wrap:wrap;margin:0 -5px 10px;}
+  .tile{flex:1 1 190px;margin:0 5px 6px;padding:8px 10px;}
+  .tile .k{font-size:12px;color:var(--body);} .tile .v{font-size:20px;font-weight:600;line-height:1.2;margin-top:2px;color:var(--ink);}
+  .tile .s{font-size:12px;color:var(--faint);}
+  .vlegend{display:flex;flex-wrap:wrap;gap:6px 18px;font-size:12px;margin:4px 0 6px;color:var(--body);}
+  .vlegend i{display:inline-block;vertical-align:middle;margin-right:6px;}
+  .sw-line{width:16px;height:3px;border-radius:2px;}
+  .sw-dot{width:9px;height:9px;border-radius:50%;background:var(--senti);opacity:0.6;}
+  .sw-box{width:12px;height:12px;border-radius:3px;border:1px solid var(--hair);}
+  .sw-earn{width:3px;height:14px;background:var(--earn);}
+  .sw-ring{width:9px;height:9px;border-radius:50%;border:2px solid var(--body);}
+  .sw-band{width:14px;height:10px;border-radius:2px;background:#2f2f2c;border:1px dashed #6b6a65;}
+  .vwrap{position:relative;}
+  #chart{overflow:visible;}
+  svg{display:block;width:100%;height:auto;}
+  .grid{stroke:var(--hair2);stroke-width:1;} .zero,.brk{stroke:var(--hair);stroke-width:1;} .daysep{stroke:var(--hair2);stroke-width:1;}
+  .bg-ext{fill:#1f1f1d;} .bg-closed{fill:#262624;}
+  .line-price{fill:none;stroke:var(--price);stroke-width:2;stroke-linejoin:round;stroke-linecap:round;}
+  .line-senti{fill:none;stroke:var(--senti);stroke-width:2.2;stroke-linejoin:round;stroke-linecap:round;}
+  .dot-mention{fill:var(--senti);fill-opacity:0.6;stroke:var(--surface);stroke-width:1.5;}
+  .dot-price{fill:var(--price);stroke:var(--surface);stroke-width:2;} .dot-senti{fill:var(--senti);stroke:var(--surface);stroke-width:2;}
+  .xhair{stroke:#6b6a65;stroke-width:1;}
+  .rb-r{fill:var(--rib-r);} .rb-p,.rb-a{fill:var(--rib-x);} .rb-o,.rb-w,.rb-h,.rb-q{fill:var(--rib-c);}
+  .rb-text{fill:var(--ink);font-size:10.5px;}
+  .tick{fill:var(--body);font-size:11px;} .axis-title{fill:var(--body);font-size:11px;}
+  .earnline{stroke:var(--earn);stroke-width:1.3;stroke-dasharray:4 3;opacity:0.85;}
+  .earntag{fill:var(--earn);} .earntaglbl{fill:#121211;font-size:10px;font-weight:bold;}
+  .earntiptxt{fill:var(--ink);font-family:var(--ui);}
+  .zoomrect{fill:var(--price);fill-opacity:0.14;stroke:var(--price);stroke-dasharray:3 2;}
+  .tip{position:absolute;top:8px;pointer-events:none;font-size:12px;line-height:1.45;padding:7px 10px;border-radius:8px;
+       box-shadow:0 4px 14px rgba(0,0,0,0.5);min-width:200px;max-width:290px;background:var(--raise);color:var(--ink);border:1px solid #4a4945;}
+  .tt-head{font-weight:600;margin-bottom:2px;} .tip .muted{color:var(--faint);}
+  .vnote{font-size:12.5px;margin:8px 0 0;color:var(--faint);line-height:1.5;}
+  details.card summary{cursor:pointer;font-size:13px;font-weight:600;color:var(--body);}
+  .tblwrap{max-height:340px;overflow:auto;margin-top:10px;}
+  table{border-collapse:collapse;width:100%;font-size:12.5px;color:var(--ink);}
+  th,td{text-align:left;padding:5px 8px;border-bottom:1px solid var(--hair2);}
+  th{position:sticky;top:0;background:var(--surface);color:var(--body);}
+  td.num,th.num{text-align:right;font-variant-numeric:tabular-nums;}
+  /* study section */
+  .verdict{border-left:3px solid var(--accent);background:var(--panel);border-radius:6px;padding:12px 16px;margin:0 0 14px;font-size:15px;line-height:1.55;color:var(--ink);}
+  .verdict .sub{display:block;color:var(--body);font-size:13.5px;margin-top:6px;}
+  .lbl{fill:var(--ink);font-size:12.5px;} .lbl2{fill:var(--faint);font-size:11px;}
+  .ci{stroke:var(--price);stroke-width:2;stroke-linecap:round;} .pt-full{fill:var(--price);stroke:var(--surface);stroke-width:2;}
+  .pt-half{fill:var(--surface);stroke:var(--body);stroke-width:1.8;}
+  .bar-sig{fill:var(--price);} .bar-ns{fill:var(--muted-mark);}
+  .band{fill:#2f2f2c;stroke:#6b6a65;stroke-dasharray:3 3;stroke-width:1;}
+  .methods h4{font-size:13px;color:var(--ink);margin:14px 0 4px;}
+  .methods p,.methods li{font-size:13px;color:var(--body);line-height:1.55;}
+  .methods ul{margin:4px 0 8px 18px;padding:0;}
+  @media(max-width:760px){ .controls{gap:10px;} .wrap{padding:0 12px 70px;} }
 </style>
 
 <div class="wrap">
@@ -383,23 +498,46 @@ TEMPLATE = r"""
   </nav>
 
   <h1>Sentiment vs Price</h1>
-  <!-- Pipeline freshness. Populated by updateFreshness() from D.freshness; hidden
-       until then so a JS failure never shows a misleading "fresh" state. -->
   <div id="freshBar" class="freshbar" style="display:none;"></div>
-  <p class="intro lead">This dashboard explores whether public sentiment about a stock, drawn from news and
-     social media, anticipates, follows, or has no relationship to its price, following the methodology set
-     out in the <a href="proposal.html">research proposal</a>.</p>
+  <p class="intro">Does what people say about a stock in the news and on social media tell us anything about where its
+     price goes <b>next</b>, once earnings reports, market-wide moves and the fact that people talk about moves that already
+     happened are taken into account? The first section answers that across every tracked stock; the second lets you look
+     at one stock at a time. Methodology follows the <a href="proposal.html">research proposal</a>.</p>
+
+  <section class="card" id="study">
+    <h3>Across all stocks</h3>
+    <div class="verdict" id="verdict"></div>
+    <div class="vcontrols">
+      <div class="grp"><span>Source</span>
+        <div class="seg" id="stScope" role="group" aria-label="Mention source for the study results">
+          <button type="button" data-v="both">Both</button><button type="button" data-v="social">Social</button><button type="button" data-v="news">News</button></div></div>
+      <div class="grp"><span>Earnings days</span>
+        <div class="seg" id="stReg" role="group" aria-label="Earnings regime for the study results">
+          <button type="button" data-v="all">Included</button><button type="button" data-v="ex_earn">Excluded</button><button type="button" data-v="earn">Only</button></div></div>
+    </div>
+    <div class="vstats" id="studyTiles"></div>
+    <div class="vlegend">
+      <span><i class="sw-dot" style="background:var(--price);opacity:1"></i>Whole sample, line = 95% confidence interval</span>
+      <span><i class="sw-ring"></i>First 70% / last 30% of dates (does it replicate?)</span>
+    </div>
+    <div class="vwrap" id="fwrap">
+      <svg id="forest" viewBox="0 0 960 250" role="img" aria-label="Estimated effect of sentiment on the next return, with confidence intervals"></svg>
+      <div id="ftip" class="tip" hidden></div>
+    </div>
+    <p class="vnote" id="studyNote"></p>
+    <details class="methods"><summary style="cursor:pointer;font-weight:600;color:var(--body);margin-top:6px;">How this is measured</summary><div id="methods"></div></details>
+  </section>
+
+  <h2>One stock at a time</h2>
   <div class="howto">
-    <p style="margin:0 0 8px;"><b>Reading the chart.</b> For the selected stock, the <b style="color:var(--price)">blue line</b>
-       is the <b>price</b> (left axis, in dollars) and the <b style="color:var(--senti)">green line</b> is the
-       <b>sentiment</b> (right axis), a smoothed trend with faint dots at each day's mentions. Grey bars at the bottom
-       show how many mentions occurred each day. <b>Drag across the chart to zoom in;</b> once zoomed to intraday
-       resolution the background shades by market session (pre-market, regular hours, after-hours, overnight, weekend,
-       holiday), so you can see whether price moved before the regular session even opened.</p>
-    <p style="margin:0;"><b>Sentiment runs from −1 to +1:</b> <span class="neg">−1</span> means the mentions were
-       maximally <b>negative / bearish</b>, <span style="color:var(--neut,#9a7a12);font-weight:bold;">0</span> is neutral
-       or mixed, and <span class="pos">+1</span> means maximally <b>positive / bullish</b>. The <b>lead/lag chart</b> below
-       is the rigorous test: it measures whether sentiment moves <i>before</i> price (leads) or <i>after</i> it (reacts).</p>
+    <p style="margin:0 0 8px;"><b>Reading the chart.</b> The <b style="color:var(--price)">blue line</b> is the
+       <b>price</b> (left axis) and the <b style="color:var(--senti)">orange line</b> is the <b>sentiment level</b>
+       (right axis, −1 bearish to +1 bullish), a time-decayed average of mention stances. Orange dots are the raw averages per
+       time bucket, sized by how many mentions had a stance. Time runs in half-hour steps across pre-market, regular hours and
+       after-hours; closed time (overnight, weekends, holidays) is squeezed into a marked break. Pick a window, or
+       <b>drag across the chart to zoom</b>.</p>
+    <p style="margin:0;">The chart shows timing only. The <b>lead/lag charts</b> below it test it, with a band showing how
+       big a correlation chance alone produces.</p>
   </div>
 
   <div class="controls">
@@ -409,598 +547,548 @@ TEMPLATE = r"""
     <div class="fld"><label for="catSel">Group / filter stocks by</label>
       <select id="catSel"><option value="all">All stocks</option><option value="sector">Sector</option><option value="mcap_bucket">Market cap</option><option value="source_favored">Source-favored</option></select></div>
     <div class="fld" id="catValWrap" style="display:none;"><label for="catVal">&nbsp;</label><select id="catVal"></select></div>
-    <div class="fld" id="earnRegWrap" style="display:none;"><label for="earnReg">Earnings</label>
-      <select id="earnReg"><option value="all">Show all</option><option value="ex_earn">Exclude earnings</option><option value="earn">Earnings only</option></select></div>
+    <div class="fld"><label for="earnReg">Earnings days</label>
+      <select id="earnReg"><option value="all">Included</option><option value="ex_earn">Excluded</option></select></div>
     <div class="fld"><label>&nbsp;</label><a id="mentionsBtn" class="mentionsbtn" href="#" target="_blank" rel="noopener">View mentions ↗</a></div>
   </div>
 
-  <div class="caveat" id="caveat"></div>
+  <div class="caveat" id="caveat" style="display:none;"></div>
   <div class="statrow" id="stats"></div>
   <div class="catrow" id="catline"></div>
 
-  <div class="legend">
-    <span><i style="background:var(--price)"></i> Price ($, left axis)</span>
-    <span><i style="background:var(--senti)"></i> Sentiment (14-day smoothed trend; faint dots = daily means) (−1…+1, right axis)</span>
-    <span><i style="background:var(--vol);height:8px;width:8px;border-radius:2px"></i> Mention volume</span>
-    <span id="earnLegend" style="display:none;"><i style="background:#b58900;width:3px;height:16px;"></i> Earnings report (hover for beat/miss)</span>
-  </div>
-  <div class="zoombar">
-    <span id="zoomHint" class="zoomhint">Tip: drag across the chart to zoom in (sessions shade when zoomed to intraday).</span>
-    <button id="zoomReset" class="zoomreset" style="display:none;">Reset zoom</button>
-  </div>
-  <div class="legend sesslegend" id="sessLegend" style="display:none;"></div>
-  <div class="chartwrap"><svg id="chart" viewBox="0 0 1000 380" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Sentiment and price over time"></svg></div>
+  <section class="card">
+    <div class="vcontrols">
+      <div class="grp"><span>Smoothing</span>
+        <div class="seg" id="smooth" role="group" aria-label="Sentiment smoothing">
+          <button type="button" data-s="fast">6h</button><button type="button" data-s="slow">14d</button></div></div>
+      <div class="grp"><span>Window</span>
+        <div class="seg" id="range" role="group" aria-label="Time range">
+          <button type="button" data-d="2">2D</button><button type="button" data-d="5">5D</button>
+          <button type="button" data-d="14">14D</button><button type="button" data-d="30">30D</button>
+          <button type="button" data-d="0">All</button></div></div>
+      <div class="grp"><button type="button" class="zreset" id="zoomReset" hidden>Reset zoom</button></div>
+    </div>
+    <div class="vstats" id="vstats"></div>
+    <div class="vlegend">
+      <span><i class="sw-line" style="background:var(--price)"></i>Price, $ (left axis)</span>
+      <span><i class="sw-line" style="background:var(--senti)"></i><b id="sentiKey">Sentiment, 6h half-life</b> (right axis, −1 to +1)</span>
+      <span><i class="sw-dot"></i><span id="dotKey">Mean per half-hour with mentions (size = count)</span></span>
+      <span><i class="sw-box" style="background:#1f1f1d"></i>Extended hours</span>
+      <span><i class="sw-box" style="background:#262624"></i>Closed (collapsed)</span>
+      <span id="earnLegend" style="display:none;"><i class="sw-earn"></i>Earnings report (hover)</span>
+    </div>
+    <div class="vwrap" id="vwrap">
+      <svg id="chart" viewBox="0 0 960 400" role="img" aria-label="Sentiment and price over time, half-hourly, with closed hours collapsed"></svg>
+      <div id="tip" class="tip" hidden></div>
+    </div>
+    <p class="vnote" id="vnote"></p>
+  </section>
+  <details class="card">
+    <summary>Table view (newest first)</summary>
+    <div class="tblwrap"><table>
+      <thead><tr><th>Time (ET)</th><th>Session</th><th class="num">Price</th><th class="num">Sentiment level</th><th class="num">Mentions</th><th class="num">With stance (mean)</th></tr></thead>
+      <tbody id="tbody"></tbody></table></div>
+  </details>
 
-  <h3>Lead / lag cross-correlation</h3>
-  <p class="note">Correlation of decayed sentiment with price return at each day-offset. Bars <b>right of 0</b>
-     (positive lag): sentiment <b>leads</b> price by that many days. Bars <b>left of 0</b>: sentiment
-     <b>reacts to</b> earlier price moves. This is the rigorous correlation measure (the overlay above is
-     for visual context only).</p>
-  <div class="chartwrap"><svg id="lag" viewBox="0 0 1000 220" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Lead-lag cross correlation"></svg></div>
+  <section class="card">
+    <h3>Lead / lag by trading day</h3>
+    <p>Correlation between a day’s sentiment and this stock’s market-adjusted return some trading days earlier or later.
+       Bars <b>right of 0</b> ask whether sentiment comes <b>before</b> the move; bars <b>left of 0</b> whether it
+       <b>follows</b> one. Bars inside the dashed band are within what chance alone produces (95%); only bars that leave it are
+       <b style="color:var(--price)">coloured</b>. Testing 11 offsets, about one in twenty will leave the band by luck.</p>
+    <div class="vwrap" id="lwrap"><svg id="lag" viewBox="0 0 960 230" role="img" aria-label="Daily lead-lag correlation with chance band"></svg><div id="ltip" class="tip" hidden></div></div>
+  </section>
+  <section class="card">
+    <h3>Was it priced in after hours?</h3>
+    <p>The same test in half-day steps: each trading day is split into the <b>overnight + pre-market</b> stretch (prior close
+       to the first regular-hours price) and the <b>regular session</b>. Offset +1 is the very next stretch, so a bar at +1
+       after an overnight window asks whether pre-market chatter predicts the regular session that follows. Hourly prices
+       start mid-April 2026, so this has less data than the daily view. <a href="scenarios.html">How to read these plots.</a></p>
+    <div class="vwrap" id="swrap"><svg id="sesslag" viewBox="0 0 960 230" role="img" aria-label="Half-session lead-lag correlation with chance band"></svg><div id="stip" class="tip" hidden></div></div>
+  </section>
 
-  <h3>Was the move already priced in after hours?</h3>
-  <p class="note">This is the study's central question about timing. Using hourly prices, sentiment change is
-     correlated against two versions of the price path across a range of <b>hour</b> offsets: the
-     <b style="color:var(--price)">full path</b>, which includes pre-market and after-hours moves, and the
-     <b style="color:var(--senti)">regular-hours-only path</b>, which is what a trader active only from 9:30 to 4:00
-     would experience. If sentiment leads the regular path but only coincides with, or lags, the full path, the
-     extended-hours market had likely absorbed it before the regular session opened, so a retail trader could not
-     have acted on it in time. New to these plots, or seeing the two charts disagree?
-     <a href="scenarios.html">See how to read them, with examples of each scenario.</a></p>
-  <div class="sessverdict" id="sessVerdict"></div>
-  <div class="chartwrap"><svg id="sesslag" viewBox="0 0 1000 240" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Session lead-lag comparison"></svg></div>
-
-  <footer>Research prototype. Sentiment scored deterministically (Loughran-McDonald lexicon), no LLM.
-     Correlations on limited data are illustrative, not statistically significant; they firm up as the
-     mention store accumulates over weekly collection. See the <a href="proposal.html">research proposal</a>.</footer>
+  <footer>Research prototype. Stance is the poster’s own StockTwits Bullish/Bearish tag where given, otherwise a finance word
+     list (Loughran-McDonald based, with price-move and uncertainty words removed); no LLM. Results update with every daily run.
+     See the <a href="proposal.html">research proposal</a>.</footer>
 </div>
 
 <script id="payload" type="application/json">/*DATA*/</script>
 <script>
+'use strict';
 const D = JSON.parse(document.getElementById('payload').textContent);
-
-// ---- pipeline freshness banner -------------------------------------------
-// Surfaces staleness that used to be invisible: when the nightly run is killed
-// before it publishes, the site keeps serving the last good page with no hint
-// that it is old. Age is measured in ELAPSED DAYS since generation (the run is
-// daily, so >1 day late means a run was missed), while the data dates shown are
-// the real newest mention/price dates. Thresholds are deliberately forgiving of
-// weekends: a Friday-generated page read on Sunday is 2 days old but fine.
-function updateFreshness(){
-  const f = D.freshness; const bar = document.getElementById('freshBar');
-  if(!f || !bar || !f.gen) return;                 // no data -> stay hidden
-  const ageH = (Date.now()/1000 - f.gen) / 3600;
-  const ageD = ageH / 24;
-  // Grace: the run is daily, but weekends have no new market data, so allow 3
-  // days before warning and 5 before calling it broken.
-  let cls, msg;
-  if(ageD < 3)      { cls='ok';   msg='Data current'; }
-  else if(ageD < 5) { cls='warn'; msg='Update overdue'; }
-  else              { cls='bad';  msg='Pipeline may have stopped'; }
-  // floor, not round: never overstate how old the data is (2.5 days reads "2 days")
-  const nH=Math.floor(ageH), nD=Math.floor(ageD);
-  const when = ageH < 1  ? 'less than an hour ago'
-             : ageH < 24 ? nH+' hour'+(nH===1?'':'s')+' ago'
-             :             nD+' day'+(nD===1?'':'s')+' ago';
-  const bits = ['Last updated '+when];
-  if(f.price_max)    bits.push('prices through '+f.price_max);
-  if(f.mentions_max) bits.push('mentions through '+f.mentions_max);
-  if(f.n_tickers)    bits.push(f.n_tickers+' stocks');
-  let extra='';
-  if(cls==='warn') extra=' — the daily run has not published in over 3 days.';
-  if(cls==='bad')  extra=' — no successful update in over 5 days; the figures below are stale.';
-  bar.className='freshbar '+cls;
-  bar.innerHTML='<span class="dot"></span><span class="msg">'+msg+'</span>'
-               +'<span class="detail">'+bits.join(' &middot; ')+extra+'</span>';
-  bar.style.display='';
-}
-updateFreshness();
-const A = D.analysis;
-const NS = "http://www.w3.org/2000/svg";
-function el(t,a){const e=document.createElementNS(NS,t);for(const k in a)e.setAttribute(k,a[k]);return e;}
-function txt(x,y,s,cls,anchor,extra){const e=el('text',Object.assign({x,y,class:cls||'axislbl','text-anchor':anchor||'start'},extra||{}));e.textContent=s;return e;}
-
-const SESS_FULL={p:'pre-market',r:'regular',a:'after-hours',o:'overnight',w:'weekend',h:'holiday',
-  pre_market:'pre-market',regular:'regular',after_hours:'after-hours',overnight:'overnight',weekend:'weekend',holiday:'holiday'};
-function fmtDateT(t){ const d=new Date(t*1000);
-  return MON[d.getUTCMonth()]+' '+d.getUTCDate()+' '+d.getUTCFullYear(); }
-function earnHover(tk,ev){
-  // Native SVG <title> tooltip text for an earnings marker: date, session,
-  // beat/miss + surprise%, and estimated vs reported EPS.
-  const when=fmtDateT(ev.t)+(ev.sess?(' ('+(SESS_FULL[ev.sess]||ev.sess)+')'):'');
-  let line2;
-  if(ev.surp==null||ev.rep==null){ line2='Upcoming / not yet reported'; }
-  else{ const beat=ev.surp>=0; line2=(beat?'BEAT':'MISSED')+' by '+(ev.surp>0?'+':'')+ev.surp+'%'; }
-  let line3='';
-  if(ev.est!=null||ev.rep!=null){
-    line3='EPS: est '+(ev.est==null?'?':ev.est)+' → reported '+(ev.rep==null?'?':ev.rep); }
-  return tk+' earnings · '+when+'\n'+line2+(line3?('\n'+line3):'');
-}
-
-// ---- earnings tooltip (drawn, not native <title>) -------------------------
-// Renders the earnHover text as a real SVG panel anchored to the marker. Native
-// <title> was unreliable (first-child-only, unstyleable, never fired on the "E"
-// tag); this is ordinary SVG we control and can test. One shared node per chart,
-// created lazily and removed on mouseleave.
-function hideEarnTip(){ const n=document.getElementById('earnTip'); if(n) n.remove(); }
-function showEarnTip(svg,x,yTop,text){
-  hideEarnTip();
-  const lines=text.split('\n');
-  const LH=15, PAD=8;
-  const g=el('g',{id:'earnTip','pointer-events':'none'});
-  const bg=el('rect',{rx:5,fill:'#2b2b2b','fill-opacity':0.95,stroke:'#000','stroke-opacity':0.25});
-  g.appendChild(bg);
-  const tnodes=lines.map((s,i)=>{
-    const t=txt(0, 0, s, 'earntiptxt', 'start');
-    t.setAttribute('font-size', i===0?'12.5':'12');
-    t.setAttribute('font-weight', i===0?'bold':'normal');
-    g.appendChild(t); return t;
-  });
-  svg.appendChild(g);                                 // last child => draws on top
-  // Size from the ACTUAL rendered text (getComputedTextLength) rather than a
-  // characters-times-width guess: ticker/EPS strings vary enough that an estimate
-  // either clips the text or leaves a lopsided box.
-  const w=Math.max(...tnodes.map(t=>t.getComputedTextLength())) + PAD*2;
-  const h=lines.length*LH + PAD*2 - 3;
-  // flip to the left of the marker when it would overflow the right edge
-  let tx=x+12; if(tx+w > CW-4) tx=x-12-w; if(tx<4) tx=4;
-  const ty=Math.max(4, yTop-4);
-  bg.setAttribute('x',tx); bg.setAttribute('y',ty);
-  bg.setAttribute('width',w); bg.setAttribute('height',h);
-  tnodes.forEach((t,i)=>{ t.setAttribute('x',tx+PAD); t.setAttribute('y',ty+PAD+12+i*LH); });
-}
-
-const tkSel=document.getElementById('tkSel'), srcSel=document.getElementById('srcSel'),
-      catSel=document.getElementById('catSel'), catVal=document.getElementById('catVal'),
-      catValWrap=document.getElementById('catValWrap');
-
-function catValue(tk,key){ if(key==='all')return 'all'; return A[tk][key]||'unknown'; }
-
-function populateStocks(){
-  const cat=catSel.value; const filter=catVal.value;
-  let list=D.order.filter(tk=>{
-    if(cat==='all')return true;
-    return catValue(tk,cat)===filter;
-  });
-  tkSel.innerHTML='';
-  list.forEach(tk=>{const o=document.createElement('option');o.value=tk;
-    o.textContent=`${tk}  (${A[tk].n_mentions} mentions, ${A[tk].n_overlap}d)`;tkSel.appendChild(o);});
-  if(list.length) render(list[0]);
-}
-function populateCatValues(){
-  const cat=catSel.value;
-  if(cat==='all'){catValWrap.style.display='none'; populateStocks(); return;}
-  const vals=[...new Set(D.order.map(tk=>catValue(tk,cat)))].sort();
-  catVal.innerHTML=''; vals.forEach(v=>{const o=document.createElement('option');o.value=v;o.textContent=v;catVal.appendChild(o);});
-  catValWrap.style.display=''; populateStocks();
-}
-D.order.forEach(tk=>{const o=document.createElement('option');o.value=tk;
-  o.textContent=`${tk}  (${A[tk].n_mentions} mentions, ${A[tk].n_overlap}d)`;tkSel.appendChild(o);});
-
-function fmtLag(k){ if(k===null||k===undefined) return 'n/a'; if(k>0) return `leads ${k}d`; if(k<0) return `lags ${-k}d`; return 'same day'; }
+const A = D.analysis, G = D.grid;
+const NS = 'http://www.w3.org/2000/svg';
+function $(id){ return document.getElementById(id); }
+function el(t,a,parent){ const e=document.createElementNS(NS,t); for(const k in a) e.setAttribute(k,a[k]); if(parent) parent.appendChild(e); return e; }
+function txt(x,y,s,cls,anchor,extra){ const e=el('text',Object.assign({x,y,class:cls||'axislbl','text-anchor':anchor||'start'},extra||{})); e.textContent=s; return e; }
 const MON=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-function fmtDate(iso){ if(!iso)return ''; const p=iso.split('-'); return `${MON[+p[1]-1]} ${p[2]} ’${p[0].slice(2)}`; }  // e.g. "Aug 23 ’25"
 
-// ---- TIME-AXIS chart with drag-to-zoom + session shading ----
-// Everything is plotted against unix-seconds. `viewWin` = [minT,maxT] visible span.
-const DAY=86400, HOUR=3600;
-// two versions: BAND = light tint for chart background (subtle, keeps data readable);
-// SWATCH = a stronger, clearly-distinct color for the legend so sessions are told apart.
-const SESSION_COLORS={p:'#dbe7fb',r:'#ffffff',a:'#fde3cf',o:'#e7dcf5',w:'#e2e2e2',h:'#f6d5d5'};
-const SESSION_SWATCH={p:'#4a80e0',r:'#c9ced8',a:'#e8863a',o:'#8a5cd0',w:'#8a8a8a',h:'#d15b5b'};
-const SESSION_NAME={p:'pre-market',r:'regular',a:'after-hours',o:'overnight',w:'weekend',h:'holiday'};
+// ---- pipeline freshness banner ----
+(function(){
+  const f=D.freshness, bar=$('freshBar'); if(!f||!bar||!f.gen) return;
+  const ageH=(Date.now()/1000-f.gen)/3600, ageD=ageH/24;
+  let cls,msg;
+  if(ageD<3){cls='ok';msg='Data current';} else if(ageD<5){cls='warn';msg='Update overdue';} else {cls='bad';msg='Pipeline may have stopped';}
+  const nH=Math.floor(ageH), nD=Math.floor(ageD);
+  const when=ageH<1?'less than an hour ago':ageH<24?nH+' hour'+(nH===1?'':'s')+' ago':nD+' day'+(nD===1?'':'s')+' ago';
+  const bits=['Last updated '+when];
+  if(f.price_max) bits.push('prices through '+f.price_max);
+  if(f.mentions_max) bits.push('mentions through '+f.mentions_max);
+  if(f.n_tickers) bits.push(f.n_tickers+' stocks');
+  let extra=''; if(cls==='warn') extra=' — the daily run has not published in over 3 days.';
+  if(cls==='bad') extra=' — no successful update in over 5 days; the figures below are stale.';
+  bar.className='freshbar '+cls;
+  bar.innerHTML='<span class="dot"></span><span class="msg">'+msg+'</span><span class="detail">'+bits.join(' &middot; ')+extra+'</span>';
+  bar.style.display='';
+})();
 
-// ---- client-side session classifier: mirrors market_session.py exactly ----
-// Input is a unix-second timestamp; output is a single-char session code. The ONLY
-// authoritative data it needs is D.nyse = { "YYYY-MM-DD": [open_unix, close_unix] }
-// for every trading day (weekends/holidays are the dates absent from that map).
-// ET calendar date + weekday come from Intl (America/New_York), so DST and the
-// UTC->ET date rollover are handled correctly without shipping a tz database.
-const _ET_DOW = new Intl.DateTimeFormat('en-US',{timeZone:'America/New_York',weekday:'short'});
-const _ET_YMD = new Intl.DateTimeFormat('en-CA',{timeZone:'America/New_York',
-  year:'numeric',month:'2-digit',day:'2-digit'});   // en-CA => "YYYY-MM-DD"
-const PRE_START=4*HOUR;      // 04:00 ET, seconds past ET midnight
-const AH_END=20*HOUR;        // 20:00 ET
-function _etDate(tsec){ return _ET_YMD.format(new Date(tsec*1000)); }  // "YYYY-MM-DD" in ET
-function _etDow(tsec){ return _ET_DOW.format(new Date(tsec*1000)); }   // "Mon".."Sun"
-function _prevDateStr(d){ const dt=new Date(d+'T12:00:00Z'); dt.setUTCDate(dt.getUTCDate()-1);
-  return dt.toISOString().slice(0,10); }
-function _isWeekend(d){ const w=_ET_DOW.format(new Date(d+'T16:00:00Z')); return w==='Sat'||w==='Sun'; }
-function _closedKind(d){ return _isWeekend(d) ? 'w' : 'h'; }  // weekend vs weekday holiday
-// seconds-past-ET-midnight for a timestamp (its offset from that ET calendar day's 00:00)
-function _etSecondsOfDay(tsec){
-  // find ET midnight of tsec's ET date by parsing its Y-M-D and reconstructing.
-  const d=_etDate(tsec);
-  // ET midnight in unix: the moment whose ET clock reads 00:00:00 on date d.
-  // Approximate via the day's known open (09:30 ET) when available, else via
-  // the UTC guess corrected by measuring the ET time of a probe.
-  const sched=D.nyse[d];
-  if(sched){ // open is 09:30 ET => ET-midnight = open - 9.5h (covers DST since open is real)
-    return tsec - (sched[0] - 9.5*HOUR);
-  }
-  // no schedule (weekend/holiday): derive ET midnight by formatting the ET wall time.
-  const parts=new Intl.DateTimeFormat('en-GB',{timeZone:'America/New_York',
-    hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}).formatToParts(new Date(tsec*1000));
-  let h=0,m=0,s=0; for(const p of parts){ if(p.type==='hour')h=+p.value; if(p.type==='minute')m=+p.value; if(p.type==='second')s=+p.value; }
-  if(h===24)h=0;
-  return h*HOUR+m*60+s;
-}
-function sessionAt(tsec){
-  const d=_etDate(tsec), sched=D.nyse[d];
-  const secs=_etSecondsOfDay(tsec);
-  const prev=_prevDateStr(d), prevTrading=!!D.nyse[prev];
-  if(sched){
-    // open/close expressed as seconds-past-ET-midnight for THIS date. ET midnight
-    // is the day's open (09:30 ET) minus 9.5h, which stays correct across DST
-    // because `open` is the calendar's real UTC open for that date.
-    const etMid = sched[0] - 9.5*HOUR;             // unix of 00:00 ET on d
-    const openSec = sched[0]-etMid, closeSec = sched[1]-etMid;
-    if(secs>=openSec && secs<closeSec) return 'r';
-    if(secs>=PRE_START && secs<openSec) return 'p';
-    if(secs>=closeSec && secs<AH_END) return 'a';
-    if(secs>=AH_END) return 'o';                    // 20:00–24:00 on a trading day
-    // 00:00–04:00 on a trading day: overnight tail of prior trading evening, else
-    // the weekend/holiday that just ended.
-    return prevTrading ? 'o' : _closedKind(prev);
-  }
-  // not a trading day: 00:00–04:00 may be overnight tail of prior trading evening.
-  if(secs<PRE_START && prevTrading) return 'o';
-  return _closedKind(d);
-}
-
-let viewWin=null;           // current [minT,maxT] or null = full
-let curTk=null, curScope='both';
-const CW=1000,CH=380,cmL=60,cmR=66,cmT=18,cmB=46;
-
-function dayToT(d){ return Math.floor(new Date(d+'T00:00:00Z').getTime()/1000); }
-
-function fullExtent(a,S){
-  // full time extent = the daily window we already clip to (idx_start..idx_end)
-  const t0=dayToT(a.dates[S.idx_start]), t1=dayToT(a.dates[S.idx_end])+DAY;
-  return [t0,t1];
-}
-
-function drawChart(a, scope){
-  curTk=a.ticker; curScope=scope;
-  // point the "View mentions" button at this ticker's raw-mentions table
-  const mb=document.getElementById('mentionsBtn');
-  if(mb){ mb.href='mentions.html?ticker='+encodeURIComponent(a.ticker); }
-  const svg=document.getElementById('chart'); svg.innerHTML='';
-  const S=a.scopes[scope];
-  const ext=fullExtent(a,S);
-  const win = viewWin || ext;
-  const [tMin,tMax]=win, tSpan=Math.max(1,tMax-tMin);
-  const yTop=cmT, yBot=CH-cmB;
-  const X=t=> cmL + (CW-cmL-cmR)*((t-tMin)/tSpan);
-  const inWin=t=> t>=tMin && t<=tMax;
-
-  // decide intraday vs daily: use intraday hourly bars when zoomed to <= ~20 days
-  const intr=D.intraday[a.ticker];
-  const useIntraday = intr && tSpan <= 20*DAY;
-  // shade sessions only when zoomed enough that an hour is >= ~3px wide
-  const showSessions = useIntraday && ((CW-cmL-cmR)*(HOUR/tSpan) >= 2.2);
-
-  // ---- price points in-window (intraday or daily) ----
-  let pricePts=[];  // [{t, v}]
-  if(useIntraday){
-    for(let i=0;i<intr.t.length;i++){ const t=intr.t[i];
-      if(t>=tMin-HOUR && t<=tMax+HOUR) pricePts.push({t, v:intr.p[i], s:intr.s[i]}); }
-  } else {
-    a.dates.forEach((d,i)=>{ if(a.price[i]==null)return; const t=dayToT(d)+ (13*HOUR);
-      if(t>=tMin-DAY && t<=tMax+DAY) pricePts.push({t, v:a.price[i]}); });
-  }
-  const pvals=pricePts.map(o=>o.v);
-  const pmin=Math.min(...pvals), pmax=Math.max(...pvals), pr=(pmax-pmin)||1;
-  const yPrice=v=> yBot-(yBot-yTop)*((v-pmin)/pr);
-  const yShift=v=> yBot-(yBot-yTop)*((v+1)/2);
-
-  // ---- session shading bands (background) ----
-  // Classify EVERY hour of the visible window by its own timestamp (via sessionAt,
-  // which mirrors market_session.py), not just hours that carry a price bar. This
-  // makes weekend / holiday / overnight regions shade as their own bands even where
-  // there is no price data, and prevents a sparse pre-market band from bleeding
-  // across empty hours. Consecutive same-session hours merge into one rectangle.
-  if(showSessions && D.nyse && Object.keys(D.nyse).length){
-    let bandStart=null, bandSess=null, bandEnd=null;
-    const flush=()=>{ if(bandStart!==null && bandSess && bandSess!=='r'){
-      const xs=Math.max(cmL,X(bandStart)), xe=Math.min(CW-cmR,X(bandEnd));
-      if(xe>xs) svg.appendChild(el('rect',{x:xs,y:yTop,width:xe-xs,height:yBot-yTop,
-        fill:SESSION_COLORS[bandSess]||'#fff'})); } };
-    // step across the window on hour boundaries, aligned so bands snap to real
-    // session edges. Cap the iteration count as a safety net (<=20d => <=480 hrs).
-    const start=Math.floor(tMin/HOUR)*HOUR;
-    for(let t=start; t<tMax; t+=HOUR){
-      const s=sessionAt(t+1);            // classify mid-hour to avoid boundary ties
-      const hEnd=t+HOUR;
-      if(bandStart===null){ bandSess=s; bandStart=t; bandEnd=hEnd; }
-      else if(s===bandSess){ bandEnd=hEnd; }
-      else { flush(); bandSess=s; bandStart=t; bandEnd=hEnd; }
+// ======================================================================
+// Shared time grid -> collapsed x coordinate (U), sessions, segments
+// ======================================================================
+const SLOT=1800, N=G.n, CODE=G.c;
+const TODCH='0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKL';
+const CLOSED={o:1,w:1,h:1,'?':1};
+const RUN_W=6;                         // every closed run collapses to this many slot-widths
+const NAMES={p:'Pre-market',r:'Regular',a:'After-hours',o:'Overnight',w:'Weekend',h:'Holiday','?':'Closed'};
+const SESS_FULL={pre_market:'pre-market',regular:'regular',after_hours:'after-hours',overnight:'overnight',weekend:'weekend',holiday:'holiday'};
+const TOD=new Int16Array(N), DAYI=new Int32Array(N), DAYL=G.days.map(d=>d[1]);
+for(let k=0;k<N;k++) TOD[k]=TODCH.indexOf(G.tod[k])*30;
+for(let j=0;j<G.days.length;j++){ const a=G.days[j][0], b=j+1<G.days.length?G.days[j+1][0]:N; for(let k=a;k<b;k++) DAYI[k]=j; }
+const U=new Float64Array(N+1), SEGS=[], RUNS=[];
+(function(){
+  let u=0, k=0;
+  while(k<N){
+    const c=CODE[k];
+    if(CLOSED[c]){
+      let e=k; while(e<N && CLOSED[CODE[e]]) e++;
+      const w=RUN_W/(e-k), u0=u;
+      for(let i=k;i<e;i++){ U[i]=u; u+=w; }
+      // label each sub-segment of the run by its own kind and real duration
+      let s=k; while(s<e){ let t=s; while(t<e && CODE[t]===CODE[s]) t++;
+        const hrs=(t-s)/2, h=hrs%1? hrs.toFixed(1):String(hrs);
+        SEGS.push([U[s], t<e?U[t]:u, CODE[s], NAMES[CODE[s]]+' · closed '+h+'h', NAMES[CODE[s]]]); s=t; }
+      RUNS.push([u0,u,k,e]); k=e;
+    } else {
+      let e=k; while(e<N && CODE[e]===c) e++;
+      const u0=u; for(let i=k;i<e;i++){ U[i]=u; u+=1; }
+      SEGS.push([u0,u,c,NAMES[c],c==='r'?'Regular':NAMES[c].slice(0,3)]); k=e;
     }
-    flush();
   }
+  U[N]=u;
+})();
+const FIRSTOPEN=new Int32Array(DAYL.length).fill(-1);
+for(let k=0;k<N;k++){ if(!CLOSED[CODE[k]] && FIRSTOPEN[DAYI[k]]<0) FIRSTOPEN[DAYI[k]]=k; }
+const OPENCUM=new Int32Array(N+1);            // prefix count of open slots
+for(let k=0;k<N;k++) OPENCUM[k+1]=OPENCUM[k]+(CLOSED[CODE[k]]?0:1);
+function countOpen(a,b){ return OPENCUM[b+1]-OPENCUM[a]; }
+function slotOf(t){ return Math.floor((t-G.start)/SLOT); }
+function fmtTod(m){ const h=Math.floor(m/60), mi=m%60, ap=h<12?'AM':'PM'; let h12=h%12; if(h12===0) h12=12; return h12+(mi?':'+String(mi).padStart(2,'0'):'')+' '+ap; }
+function sgn(v){ return (v<0?'−':v>0?'+':'')+Math.abs(v).toFixed(2); }
+function niceStep(span,n){ const raw=span/n, mag=Math.pow(10,Math.floor(Math.log10(raw))), f=raw/mag; return (f<=1?1:f<=2?2:f<=5?5:10)*mag; }
 
-  // gridlines + price labels
-  [pmin,(pmin+pmax)/2,pmax].forEach(v=>{ const yy=yPrice(v);
-    svg.appendChild(el('line',{x1:cmL,y1:yy,x2:CW-cmR,y2:yy,class:'gridln'}));
-    svg.appendChild(txt(cmL-8,yy+4,'$'+v.toFixed(v<10?2:0),'axislbl','end')); });
-  [-1,-0.5,0,0.5,1].forEach(v=>{ const yy=yShift(v);
-    if(v===0) svg.appendChild(el('line',{x1:cmL,y1:yy,x2:CW-cmR,y2:yy,class:'zeroln'}));
-    svg.appendChild(txt(CW-cmR+8,yy+4,v.toFixed(1),'axislbl','start')); });
+// ======================================================================
+// Per-stock series: fetched on demand, decoded once, derived per scope
+// ======================================================================
+const CACHE={};
+function fetchSeries(tk){
+  if(CACHE[tk]) return Promise.resolve(CACHE[tk]);
+  return fetch(D.series+encodeURIComponent(tk)+'.json?v='+(D.freshness&&D.freshness.gen||0))
+    .then(r=>{ if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
+    .then(j=>{ CACHE[tk]=decode(j); return CACHE[tk]; });
+}
+function undelta(a){ const o=new Array(a.length); let s=0; for(let i=0;i<a.length;i++){ s+=a[i]; o[i]=s; } return o; }
+function decode(j){
+  const P=new Float64Array(N).fill(NaN);
+  const pk=undelta(j.p); pk.forEach((k,i)=>{ P[k]=j.pv[i]; });
+  const fam={};
+  ['social','news'].forEach(f=>{ const m=j.m[f]||[[],[],[],[]]; const ks=undelta(m[0]);
+    const sum=new Float64Array(N), cnt=new Int32Array(N), tot=new Int32Array(N);
+    ks.forEach((k,i)=>{ cnt[k]=m[2][i]; sum[k]=m[1][i]/1000*m[2][i]; tot[k]=m[3]?m[3][i]:m[2][i]; });
+    fam[f]={sum,cnt,tot}; });
+  return {t:j.t, i0:j.i0, i1:j.i1, P, fam, init:j.init, scopes:{}, ll:j.ll||{}, earn:j.earn||[]};
+}
+const HL={fast:12, slow:14*48}, MIN_WEIGHT=0.05;
+function scopeData(S, scope){
+  if(S.scopes[scope]) return S.scopes[scope];
+  let sum, cnt, tot;
+  if(scope==='both'){ sum=new Float64Array(N); cnt=new Int32Array(N); tot=new Int32Array(N);
+    for(let k=0;k<N;k++){ sum[k]=S.fam.social.sum[k]+S.fam.news.sum[k]; cnt[k]=S.fam.social.cnt[k]+S.fam.news.cnt[k]; tot[k]=S.fam.social.tot[k]+S.fam.news.tot[k]; } }
+  else { sum=S.fam[scope].sum; cnt=S.fam[scope].cnt; tot=S.fam[scope].tot; }
+  const lev={};
+  for(const sp of ['fast','slow']){
+    const f=Math.pow(0.5,1/HL[sp]), out=new Float64Array(N);
+    let [s,w]=(S.init[scope]||{})[sp==='fast'?'f':'s']||[0,0];
+    for(let k=0;k<N;k++){ s*=f; w*=f; if(cnt[k]){ s+=sum[k]; w+=cnt[k]; } out[k]=w>=MIN_WEIGHT? s/w : NaN; }
+    lev[sp]=out;
+  }
+  return (S.scopes[scope]={sum,cnt,tot,lev});
+}
 
-  // mention-volume bars (daily) within window
-  const vmax=Math.max(1,...S.mention_count);
-  S.mention_count.forEach((c,i)=>{ if(c<=0)return; const t=dayToT(a.dates[i])+13*HOUR;
-    if(!inWin(t))return; const h=(yBot-yTop)*0.15*c/vmax;
-    svg.appendChild(el('rect',{x:X(t)-1.3,y:yBot-h,width:2.6,height:h,fill:'var(--vol)'})); });
+// ======================================================================
+// Main chart (v2)
+// ======================================================================
+const VW=960, PX0=84, PX1=896, PW=PX1-PX0, PY0=14, PY1=318, PH=PY1-PY0;
+const RIB_Y=330, RIB_H=20, TICK_Y=368, DAY_Y=388;
+const EDGE={0:'',240:'4a',570:'9:30',960:'4p',1200:'8p'};
+const view={tk:null, scope:'both', smooth:'fast', days:14, zoom:null};
+const svg=$('chart'), wrap=$('vwrap'), tip=$('tip');
+function fitSvg(){ const w=wrap.clientWidth||VW; svg.setAttribute('width',w); svg.setAttribute('height',Math.round(w*400/VW)); }
+// Windows count TRADING time: "2D" = the last 2 trading days' worth of open
+// (pre/regular/after) slots, 32 per full day, so a Monday view isn't mostly weekend.
+function windowOf(S){
+  if(view.zoom) return view.zoom;
+  const i1=S.i1; if(view.days<=0) return [S.i0,i1];
+  let need=view.days*32, i=i1;
+  while(i>S.i0){ if(!CLOSED[CODE[i]] && --need<=0) break; i--; }
+  return [i,i1];
+}
+function fitLabel(sg,wpx){ if(sg[3].length*6.2+10<=wpx) return sg[3]; if(sg[4].length*6.2+10<=wpx) return sg[4]; return ''; }
 
-  // ---- earnings markers (vertical dashed lines + hover) ----
-  // Drawn UNDER the price/sentiment lines so they read as background context. Each
-  // earnings event in-window gets a dashed vertical rule and an "E" tag; a native
-  // <title> gives the beat/miss + surprise% + EPS hover.
-  const earn=(D.earnings||{})[a.ticker]||[];
-  earn.forEach(ev=>{ if(!inWin(ev.t)) return;
-    const x=X(ev.t);
-    const g=el('g',{class:'earnmark'});
-    // NOTE: this deliberately does NOT use a native SVG <title>. That is the obvious
-    // way to do a tooltip, but it proved unreliable here — a <title> is only honoured
-    // when it is the first child of its parent, it cannot be styled or positioned,
-    // and it never appeared on the "E" tag readers actually aim at. We draw our own
-    // tooltip instead (showEarnTip below): it is real SVG we control, so it renders
-    // identically everywhere and can be verified.
-    g.appendChild(el('line',{x1:x,y1:yTop,x2:x,y2:yBot,class:'earnline'}));
-    // small "E" tag at the top of the line
-    g.appendChild(el('rect',{x:x-6,y:yTop-1,width:12,height:13,rx:2,class:'earntag'}));
-    const et=txt(x,yTop+9,'E','earntaglbl','middle'); g.appendChild(et);
-    // wide invisible hit target so the thin dashed line is not a pixel-hunt; it spans
-    // the full height INCLUDING the tag, so tag and line both trigger the tooltip.
-    const hit=el('rect',{x:x-9,y:yTop-3,width:18,height:(yBot-yTop)+6,fill:'transparent'});
-    hit.style.cursor='pointer';
-    hit.addEventListener('mouseenter',()=>showEarnTip(svg,x,yTop,earnHover(a.ticker,ev)));
-    hit.addEventListener('mouseleave',hideEarnTip);
-    g.appendChild(hit);
-    svg.appendChild(g);
+function earnHover(tk,ev){
+  const d=new Date(ev.t*1000);
+  const when=MON[d.getUTCMonth()]+' '+d.getUTCDate()+' '+d.getUTCFullYear()+(ev.sess?' ('+(SESS_FULL[ev.sess]||ev.sess)+')':'');
+  const line2=(ev.surp==null||ev.rep==null)?'Upcoming / not yet reported':((ev.surp>=0?'BEAT':'MISSED')+' by '+(ev.surp>0?'+':'')+ev.surp+'%');
+  const line3=(ev.est!=null||ev.rep!=null)?'EPS: est '+(ev.est==null?'?':ev.est)+' → reported '+(ev.rep==null?'?':ev.rep):'';
+  return tk+' earnings · '+when+'\n'+line2+(line3?'\n'+line3:'');
+}
+function hideEarnTip(){ const n=document.getElementById('earnTip'); if(n) n.remove(); }
+function showEarnTip(s,x,yTop,text,cw){
+  hideEarnTip(); const lines=text.split('\n'), LH=15, PAD=8;
+  const g=el('g',{id:'earnTip','pointer-events':'none'}); const bg=el('rect',{rx:5,fill:'#262624',stroke:'#4a4945','fill-opacity':0.97},g);
+  const tn=lines.map((l,i)=>{ const t=txt(0,0,l,'earntiptxt','start'); t.setAttribute('font-size',i===0?'12.5':'12'); t.setAttribute('font-weight',i===0?'bold':'normal'); g.appendChild(t); return t; });
+  s.appendChild(g);
+  const w=Math.max(...tn.map(t=>t.getComputedTextLength()))+PAD*2, h=lines.length*LH+PAD*2-3;
+  let tx=x+12; if(tx+w>cw-4) tx=x-12-w; if(tx<4) tx=4; const ty=Math.max(4,yTop-4);
+  bg.setAttribute('x',tx); bg.setAttribute('y',ty); bg.setAttribute('width',w); bg.setAttribute('height',h);
+  tn.forEach((t,i)=>{ t.setAttribute('x',tx+PAD); t.setAttribute('y',ty+PAD+12+i*LH); });
+}
+
+function drawMain(){
+  const tk=view.tk, S=CACHE[tk]; if(!S) return;
+  fitSvg(); svg.innerHTML=''; tip.hidden=true;
+  const sd=scopeData(S,view.scope), SER=sd.lev[view.smooth], P=S.P;
+  const [i0,i1]=windowOf(S), uA=U[i0], uB=U[i1+1], span=Math.max(1e-9,uB-uA);
+  const X=u=> PX0+(u-uA)/span*PW, cu=i=>(U[i]+U[i+1])/2;
+  // price domain
+  let lo=Infinity, hi=-Infinity;
+  for(let i=i0;i<=i1;i++){ const p=P[i]; if(p===p){ if(p<lo) lo=p; if(p>hi) hi=p; } }
+  const noPrice = lo===Infinity; if(noPrice){ lo=0; hi=1; }
+  let pad=(hi-lo)*0.08; if(!(pad>0)) pad=Math.max(hi*0.05,0.5); lo-=pad; hi+=pad;
+  const step=niceStep(hi-lo,4), yP=v=>PY1-(v-lo)/(hi-lo)*PH, yS=v=>PY1-(v+1)/2*PH;
+  // 1. backgrounds
+  SEGS.forEach(sg=>{ const a=Math.max(sg[0],uA), b=Math.min(sg[1],uB);
+    if(b>a && (sg[2]==='p'||sg[2]==='a')) el('rect',{x:X(a),y:PY0,width:X(b)-X(a),height:PH,class:'bg-ext'},svg); });
+  const longView=countOpen(i0,i1)>16*32;
+  RUNS.forEach(r=>{ const a=Math.max(r[0],uA), b=Math.min(r[1],uB);
+    if(b>a) el('rect',{x:X(a),y:PY0,width:X(b)-X(a),height:PH,class:'bg-closed'},svg);
+    if(!longView) [r[0],r[1]].forEach(e=>{ if(e>uA && e<uB) el('line',{x1:X(e),x2:X(e),y1:PY0,y2:RIB_Y+RIB_H,class:'brk'},svg); }); });
+  // 2. grid + axes
+  if(!noPrice) for(let v=Math.ceil(lo/step)*step; v<=hi+1e-9; v+=step){ const y=yP(v);
+    el('line',{x1:PX0,x2:PX1,y1:y,y2:y,class:'grid'},svg); svg.appendChild(txt(PX0-10,y+4,'$'+v.toFixed(step<1?2:0),'tick','end')); }
+  el('line',{x1:PX0,x2:PX1,y1:yS(0),y2:yS(0),class:'zero'},svg);
+  [-1,-0.5,0,0.5,1].forEach(v=>svg.appendChild(txt(PX1+10,yS(v)+4,(v<0?'−':v>0?'+':'')+Math.abs(v).toFixed(1),'tick','start')));
+  const mid=(PY0+PY1)/2;
+  svg.appendChild(txt(14,mid,'Price ($)','axis-title','middle',{transform:'rotate(-90 14 '+mid+')'}));
+  svg.appendChild(txt(VW-14,mid,'Sentiment','axis-title','middle',{transform:'rotate(90 '+(VW-14)+' '+mid+')'}));
+  // 3. earnings markers (under the lines)
+  S.earn.forEach(ev=>{ const k=slotOf(ev.t); if(k<i0||k>i1) return; const x=X(U[k]);
+    const g=el('g',{},svg); el('line',{x1:x,x2:x,y1:PY0,y2:PY1,class:'earnline'},g);
+    el('rect',{x:x-6,y:PY0-1,width:12,height:13,rx:2,class:'earntag'},g); g.appendChild(txt(x,PY0+9,'E','earntaglbl','middle'));
+    const hit=el('rect',{x:x-9,y:PY0-3,width:18,height:PH+6,fill:'transparent'},g); hit.style.cursor='pointer';
+    hit.addEventListener('mouseenter',()=>showEarnTip(svg,x,PY0,earnHover(tk,ev),VW)); hit.addEventListener('mouseleave',hideEarnTip); });
+  // 4. price line, broken where bars are more than 2 slots apart
+  let d='', last=-1e9;
+  for(let i=i0;i<=i1;i++){ const p=P[i]; if(p!==p) continue; d+=(i-last>2?'M':'L')+X(cu(i)).toFixed(1)+' '+yP(p).toFixed(1)+' '; last=i; }
+  if(d) el('path',{d,class:'line-price'},svg);
+  // 5. sentiment level, broken where the decayed evidence is too thin
+  d='';
+  for(let i=i0;i<=i1;i++){ const s=SER[i]; if(s!==s) continue; d+=((i===i0||SER[i-1]!==SER[i-1])?'M':'L')+X(cu(i)).toFixed(1)+' '+yS(s).toFixed(1)+' '; }
+  if(d) el('path',{d,class:'line-senti'},svg);
+  // 6. raw means, bucketed so long windows stay readable: half-hour, 1h, 4h, then per day
+  const openN=countOpen(i0,i1), B=openN<=320?1:openN<=640?2:openN<=1600?8:0;
+  const dots=[]; let cmax=1;
+  if(B>0){ for(let a=i0;a<=i1;a+=B){ let s=0,c=0; const e=Math.min(i1,a+B-1); for(let i=a;i<=e;i++){ s+=sd.sum[i]; c+=sd.cnt[i]; }
+      if(c){ dots.push([(U[a]+U[e+1])/2,s/c,c]); if(c>cmax) cmax=c; } } }
+  else { let a=i0; while(a<=i1){ let e=a; while(e<i1 && DAYI[e+1]===DAYI[a]) e++; let s=0,c=0; for(let i=a;i<=e;i++){ s+=sd.sum[i]; c+=sd.cnt[i]; }
+      const f=FIRSTOPEN[DAYI[a]]; if(c){ const uc=(f>=a&&f<=e)? (U[f]+U[Math.min(e,f+31)+1])/2 : (U[a]+U[e+1])/2; dots.push([uc,s/c,c]); if(c>cmax) cmax=c; } a=e+1; } }
+  const bucketName=B===1?'half-hour':B===2?'hour':B===8?'4 hours':'day';
+  dots.forEach(d=>el('circle',{cx:X(d[0]).toFixed(1),cy:yS(d[1]).toFixed(1),r:(2.2+2.8*Math.sqrt(d[2]/cmax)).toFixed(1),class:'dot-mention'},svg));
+  $('dotKey').textContent='Mean per '+bucketName+' with mentions (size = count)';
+  // 7. session ribbon
+  SEGS.forEach(sg=>{ const a=Math.max(sg[0],uA), b=Math.min(sg[1],uB); if(b<=a) return;
+    const x0=X(a), x1=X(b); el('rect',{x:x0,y:RIB_Y,width:x1-x0,height:RIB_H,class:'rb-'+(sg[2]==='?'?'q':sg[2])},svg);
+    const lab=fitLabel(sg,x1-x0); if(lab) svg.appendChild(txt((x0+x1)/2,RIB_Y+14,lab,'rb-text','middle')); });
+  // 8. time + day ticks (ET), thinned so labels never collide
+  const nDays=countOpen(i0,i1)/32; let lastT=-1e9, lastD=-1e9;
+  // day labels sit at each day's FIRST OPEN slot (so weekends/holidays, which have
+  // none, get no label inside their collapsed break); separators at that same point
+  for(let i=i0;i<=i1;i++){
+    if(FIRSTOPEN[DAYI[i]]===i){
+      const x=X(U[i]); if(nDays<=16 && i>i0) el('line',{x1:x,x2:x,y1:PY0,y2:RIB_Y+RIB_H,class:'daysep'},svg);
+      if(x-lastD>=74 && x<=PX1-30){ svg.appendChild(txt(x+3,DAY_Y,DAYL[DAYI[i]],'tick','start')); lastD=x; } }
+    const tod=TOD[i]; if(tod===0 || !(tod in EDGE) || CLOSED[CODE[i]]) continue; const x=X(U[i]);
+    if(nDays<=10 && x-lastT>=36){ svg.appendChild(txt(x,TICK_Y,EDGE[tod],'tick','middle')); lastT=x; } }
+  // 9. hover + drag-to-zoom layer (last, on top)
+  const xh=el('line',{x1:0,x2:0,y1:PY0,y2:PY1,class:'xhair',visibility:'hidden'},svg);
+  const dP=el('circle',{r:4.5,class:'dot-price',visibility:'hidden'},svg), dS=el('circle',{r:4.5,class:'dot-senti',visibility:'hidden'},svg);
+  const ov=el('rect',{x:PX0,y:PY0,width:PW,height:PH,fill:'transparent'},svg); ov.style.cursor='crosshair';
+  const slotAt=px=>{ const u=uA+(px-PX0)/PW*span; let a=i0,b=i1; while(a<b){ const m=(a+b+1)>>1; if(U[m]<=u) a=m; else b=m-1; } return a; };
+  const vbx=e=>{ const r=svg.getBoundingClientRect(); return (e.clientX-r.left)/r.width*VW; };
+  const place=(c,ok,x,y)=>{ if(!ok){ c.setAttribute('visibility','hidden'); return; } c.setAttribute('cx',x.toFixed(1)); c.setAttribute('cy',y.toFixed(1)); c.setAttribute('visibility','visible'); };
+  function show(j){
+    const x=X(cu(j)); xh.setAttribute('x1',x); xh.setAttribute('x2',x); xh.setAttribute('visibility','visible');
+    place(dP,P[j]===P[j],x,P[j]===P[j]?yP(P[j]):0); place(dS,SER[j]===SER[j],x,SER[j]===SER[j]?yS(SER[j]):0);
+    let pt; if(P[j]===P[j]) pt='$'+P[j].toFixed(2)+' (bar)'; else { let q=j-1; while(q>=i0 && j-q<=2 && P[q]!==P[q]) q--;
+      pt=(q>=i0 && j-q<=2 && P[q]===P[q])? '$'+P[q].toFixed(2)+' (last bar, '+fmtTod(TOD[q])+')' : '<span class="muted">no trade</span>'; }
+    const c=sd.cnt[j], tt=sd.tot[j];
+    tip.innerHTML='<div class="tt-head">'+DAYL[DAYI[j]]+' · '+fmtTod(TOD[j])+' ET</div><div>'+NAMES[CODE[j]]+'</div>'+
+      '<div>Price: '+pt+'</div><div>Sentiment level: '+(SER[j]===SER[j]?sgn(SER[j]):'—')+'</div>'+
+      '<div>Mentions: '+tt+(tt? ' · '+c+' with a stance'+(c?' (mean '+sgn(sd.sum[j]/c)+')':''):'')+'</div>';
+    tip.hidden=false; const rw=svg.getBoundingClientRect().width; let left=x/VW*rw+14; if(left>rw-250) left-=284; tip.style.left=Math.max(0,left)+'px';
+  }
+  function hide(){ [xh,dP,dS].forEach(n=>n.setAttribute('visibility','hidden')); tip.hidden=true; }
+  let dragX=null, zr=null;
+  ov.addEventListener('mousedown',e=>{ dragX=vbx(e); zr=el('rect',{x:dragX,y:PY0,width:0,height:PH,class:'zoomrect','pointer-events':'none'},svg); });
+  ov.addEventListener('mousemove',e=>{ const px=vbx(e);
+    if(dragX!==null){ zr.setAttribute('x',Math.min(dragX,px)); zr.setAttribute('width',Math.abs(px-dragX)); hide(); }
+    else show(slotAt(px)); });
+  ov.addEventListener('mouseup',e=>{ if(dragX===null) return; const px=vbx(e), a=Math.min(dragX,px), b=Math.max(dragX,px);
+    dragX=null; if(zr){ zr.remove(); zr=null; }
+    if(b-a>8){ const s0=slotAt(a), s1=slotAt(b); if(s1-s0>=4){ view.zoom=[s0,s1]; drawMain(); } } });
+  ov.addEventListener('mouseleave',()=>{ hide(); dragX=null; if(zr){ zr.remove(); zr=null; } });
+  $('zoomReset').hidden=!view.zoom;
+  // stats tiles + note + table
+  let lp=NaN, lpi=-1, ls=NaN, n24=0;
+  for(let i=S.i1;i>=S.i0;i--){ if(lpi<0 && P[i]===P[i]){ lp=P[i]; lpi=i; } if(ls!==ls && SER[i]===SER[i]) ls=SER[i]; if(lpi>=0 && ls===ls) break; }
+  for(let i=Math.max(0,S.i1-47);i<=S.i1;i++) n24+=sd.tot[i];
+  const tile=(k,v,s)=>'<div class="tile"><div class="k">'+k+'</div><div class="v">'+v+'</div><div class="s">'+s+'</div></div>';
+  $('vstats').innerHTML=tile('Latest price',lp===lp?'$'+lp.toFixed(2):'—',lpi>=0?DAYL[DAYI[lpi]]+', '+fmtTod(TOD[lpi])+' ET':'no price bars yet')+
+    tile('Sentiment level',ls===ls?sgn(ls):'—',(view.smooth==='fast'?'6-hour':'14-day')+' half-life, −1 to +1')+
+    tile('Mentions, last 24h',String(n24),view.scope==='both'?'social + news':view.scope);
+  $('sentiKey').textContent=view.smooth==='fast'?'Sentiment, 6h half-life':'Sentiment, 14-day half-life';
+  $('vnote').textContent='Each slot is 30 minutes (US Eastern). Pre-market, regular and after-hours share one scale; each closed run is one fixed-width break, so order is kept but spacing inside a break is not. '+
+    'The line is a time-decayed average of mention stances (poster’s Bullish/Bearish tag where given, otherwise the finance word list) with the chosen half-life; it holds its value through quiet spells and is hidden once fewer than '+MIN_WEIGHT+' mentions’ worth of decayed evidence remain. '+
+    'Dots are raw mean stances per '+bucketName+' (coarser on longer windows), sized by how many mentions had a stance. Mentions with no stance (no finance words, or news that only reports a price move) count toward volume but not toward sentiment. This chart shows timing only; the tests are below.';
+  const rows=[];
+  for(let i=i1;i>=i0 && rows.length<300;i--){ const c=sd.cnt[i]; if(P[i]!==P[i] && !sd.tot[i]) continue;
+    rows.push('<tr><td>'+DAYL[DAYI[i]]+' '+fmtTod(TOD[i])+'</td><td>'+NAMES[CODE[i]]+'</td><td class="num">'+(P[i]===P[i]?'$'+P[i].toFixed(2):'—')+
+      '</td><td class="num">'+(SER[i]===SER[i]?sgn(SER[i]):'—')+'</td><td class="num">'+sd.tot[i]+'</td><td class="num">'+(c? c+' ('+sgn(sd.sum[i]/c)+')':'0')+'</td></tr>'); }
+  $('tbody').innerHTML=rows.join('');
+}
+function drawAll(){ const S=CACHE[view.tk]; if(!S) return; drawMain(); drawStockLags(S); }
+function loadMain(tk){
+  view.tk=tk; view.zoom=null;
+  if(CACHE[tk]){ drawAll(); return; }
+  svg.innerHTML=''; $('vstats').innerHTML=''; $('tbody').innerHTML=''; $('lag').innerHTML=''; $('sesslag').innerHTML='';
+  svg.appendChild(txt(VW/2,200,'Loading '+tk+'…','tick','middle'));
+  fetchSeries(tk).then(()=>{ if(view.tk===tk) drawAll(); })
+    .catch(err=>{ if(view.tk!==tk) return; svg.innerHTML=''; svg.appendChild(txt(VW/2,200,'Could not load chart data for '+tk+' ('+err.message+').','tick','middle')); });
+}
+
+
+// ======================================================================
+// Study-wide results (analysis_v2.json)
+// ======================================================================
+const ST=D.study, study={scope:'both', reg:'ex_earn'};
+const PRED=[['daily','Next trading day','sentiment over a day → next day, close to close'],
+            ['open','Regular session','overnight + pre-market sentiment → that day’s 9:30–4:00 return'],
+            ['overnight','Overnight gap','regular-session sentiment → close to next open']];
+const SCOPE_NAME={both:'news and social',social:'social-media',news:'news'};
+const REG_NAME={all:'earnings days included',ex_earn:'earnings days excluded',earn:'earnings days only'};
+function fmtB(b){ return (b>0?'+':b<0?'−':'')+Math.abs(b).toFixed(1); }
+function fmtP(p){ return p==null?'—':p<0.001?'p < 0.001':'p = '+p.toFixed(p<0.01?3:2); }
+function res(key,scope,reg,pe){ const t=ST&&ST.tests[key]; return t? (((t.res[scope]||{})[reg]||{})[pe]||null) : null; }
+function robust(key){ const f=res(key,study.scope,study.reg,'full'), e=res(key,study.scope,study.reg,'early'), l=res(key,study.scope,study.reg,'late');
+  return !!(f && e && l && f.p<0.05 && Math.sign(e.b)===Math.sign(f.b) && Math.sign(l.b)===Math.sign(f.b) && Math.abs(e.t)>=1 && Math.abs(l.t)>=1); }
+function drawStudy(){
+  const vd=$('verdict');
+  if(!ST){ vd.innerHTML='The study-wide analysis has not been generated yet (data/analysis_v2.json missing).'; return; }
+  syncSeg2('stScope',study.scope); syncSeg2('stReg',study.reg);
+  const sc=study.scope, rg=study.reg, who=SCOPE_NAME[sc];
+  const preds=PRED.map(p=>[p,res(p[0],sc,rg,'full')]).filter(x=>x[1]);
+  const rob=PRED.filter(p=>robust(p[0])), nom=preds.filter(x=>x[1].p<0.05);
+  const re=res('react',sc,rg,'full'), same=res('same',sc,rg,'full');
+  let head;
+  if(!preds.length) head='Not enough '+who+' data with '+REG_NAME[rg]+' to run the tests.';
+  else if(rob.length){ const r=res(rob[0][0],sc,rg,'full');
+    head=(r.b>0?'Higher':'Lower')+' '+who+' sentiment is followed by a <b>'+(r.b>0?'higher':'lower')+'</b> '+rob[0][1].toLowerCase()+' return ('+fmtB(r.b)+' basis points per standard deviation of sentiment, '+fmtP(r.p)+'), and the sign holds in both halves of the data. '+
+      (r.b<0?'That is a <b>reversal</b>: enthusiasm comes before underperformance, not outperformance. ':'')+'Treat it as a lead to re-test, not a trading signal: '+(PRED.length*3*3)+' variants are tested here, and some will look significant by chance.'; }
+  else head='<b>No reliable evidence that '+who+' sentiment predicts the next return</b> ('+REG_NAME[rg]+'). '+
+      (nom.length? nom.length+' of '+preds.length+' tests clear p < 0.05 on the whole sample, but '+(nom.length===1?'it does':'they do')+' not hold up in both halves of the data. ' : 'None of the '+preds.length+' timing tests clears p < 0.05. ');
+  let sub='';
+  if(re && re.t>3) sub+='Sentiment does <b>follow</b> price: after a day that is one standard deviation better than usual, the next day’s sentiment is '+re.b.toFixed(2)+' standard deviations more bullish (t = '+re.t.toFixed(1)+'). ';
+  if(re && re.t<=3) sub+='There is no clear reaction to the previous day’s return in this slice either (t = '+re.t.toFixed(1)+'). ';
+  if(same && same.t>3) sub+='On the same day the link is strong ('+fmtB(same.b)+' bp per standard deviation, t = '+same.t.toFixed(1)+'), which is what reacting to price, rather than anticipating it, looks like.';
+  else if(same) sub+='The same-day link is not clearly different from zero here ('+fmtB(same.b)+' bp, t = '+same.t.toFixed(1)+'); this slice may simply have too little data.';
+  vd.innerHTML=head+(sub?'<span class="sub">'+sub+'</span>':'');
+  // tiles
+  const t=(k,v,s)=>'<div class="tile"><div class="k">'+k+'</div><div class="v">'+v+'</div><div class="s">'+s+'</div></div>';
+  const d=res('daily',sc,rg,'full'), ls=((ST.longshort||{}).daily||{})[rg==='earn'?'all':rg], fd=((ST.fdr||{})[sc]||{})[rg==='earn'?'all':rg];
+  $('studyTiles').innerHTML=
+    t('Next-day effect',d?fmtB(d.b)+' bp':'—',d?'per 1 sd of sentiment · 95% CI '+fmtB(d.b-1.96*d.se)+' to '+fmtB(d.b+1.96*d.se)+' · '+fmtP(d.p):'not enough data')+
+    t('Sentiment follows price',re?re.b.toFixed(2)+' sd':'—',re?'per 1 sd return the day before · t = '+re.t.toFixed(1):'not enough data')+
+    t('Top vs bottom fifth',ls?fmtB(ls.mean_bp)+' bp/day':'—',ls?'next-day spread, both sources'+(rg==='earn'?', earnings days included':'')+' · '+fmtP(ls.p)+' · '+ls.nd+' days':'needs 50+ stocks a day')+
+    t('Stocks with a “significant” next-day link',fd?fd.sig05+' of '+fd.n:'—',fd?'about '+Math.round(fd.expected05)+' expected by chance · '+fd.fdr10+' survive a false-discovery check'+(rg==='earn'?' (earnings days included)':''):'');
+  drawForest(sc,rg);
+  const cv=ST.coverage||{};
+  $('studyNote').textContent='Effects are in basis points (0.01%) of market-adjusted return per one standard deviation of a stock’s own sentiment, from one regression pooled across all stocks with stock fixed effects, controls for the return already known and for mention volume, and standard errors clustered by date. '+
+    'Data: '+(cv.n_stocks||0)+' stocks, '+(cv.n_mentions||0).toLocaleString()+' mentions ('+(cv.n_stanced||0).toLocaleString()+' with a stance); daily prices '+cv.daily_from+' to '+cv.daily_to+', hourly prices from '+cv.sess_from+'. Holdout split at '+cv.split_date+'. Updated '+ST.generated+'.';
+  drawMethods();
+}
+function syncSeg2(id,val){ document.querySelectorAll('#'+id+' button').forEach(b=>{ const on=b.getAttribute('data-v')===val; b.className=on?'on':''; b.setAttribute('aria-pressed',on?'true':'false'); }); }
+function drawForest(sc,rg){
+  const s=$('forest'), tipEl=$('ftip'); s.innerHTML=''; tipEl.hidden=true;
+  const W=960, L=300, R=930, top=34, rowH=62;
+  const rows=PRED.map(p=>({p, f:res(p[0],sc,rg,'full'), e:res(p[0],sc,rg,'early'), l:res(p[0],sc,rg,'late')}));
+  let m=5; rows.forEach(r=>[r.f,r.e,r.l].forEach(x=>{ if(x){ m=Math.max(m,Math.abs(x.b)+1.96*x.se); } }));
+  m=Math.ceil(m*1.1/5)*5;
+  const X=v=>L+(v+m)/(2*m)*(R-L), H=top+rows.length*rowH+48;
+  s.setAttribute('viewBox','0 0 '+W+' '+H);
+  const step=niceStep(2*m,6);
+  for(let v=-Math.floor(m/step)*step; v<=m+1e-9; v+=step){ const x=X(v);
+    el('line',{x1:x,x2:x,y1:top-8,y2:H-48,class:v===0?'zero':'grid'},s); s.appendChild(txt(x,H-32,(v>0?'+':v<0?'−':'')+Math.abs(v).toFixed(step<1?1:0),'tick','middle')); }
+  s.appendChild(txt(X(0),H-10,'basis points of next return per 1 sd of sentiment','axis-title','middle'));
+  s.appendChild(txt(X(-m)+4,top-14,'← sentiment followed by lower returns','lbl2','start'));
+  s.appendChild(txt(X(m)-4,top-14,'followed by higher returns →','lbl2','end'));
+  rows.forEach((r,i)=>{ const y=top+i*rowH+rowH/2;
+    s.appendChild(txt(16,y-4,r.p[1],'lbl','start')); s.appendChild(txt(16,y+12,r.p[2],'lbl2','start'));
+    if(!r.f){ s.appendChild(txt(X(0)+8,y+4,'not enough data','lbl2','start')); return; }
+    const a=r.f.b-1.96*r.f.se, b=r.f.b+1.96*r.f.se;
+    el('line',{x1:X(Math.max(-m,a)),x2:X(Math.min(m,b)),y1:y,y2:y,class:'ci'},s);
+    el('circle',{cx:X(r.f.b),cy:y,r:6,class:'pt-full'},s);
+    if(r.e) el('circle',{cx:X(r.e.b),cy:y-14,r:4.5,class:'pt-half'},s);
+    if(r.l) el('circle',{cx:X(r.l.b),cy:y+14,r:4.5,class:'pt-half'},s);
+    if(r.e) s.appendChild(txt(X(r.e.b)+8,y-10,'first 70%','lbl2','start'));
+    if(r.l) s.appendChild(txt(X(r.l.b)+8,y+18,'last 30%','lbl2','start'));
+    const hit=el('rect',{x:0,y:y-rowH/2,width:W,height:rowH,fill:'transparent'},s);
+    hit.addEventListener('mousemove',ev=>{ const q=x=>x? fmtB(x.b)+' bp (t = '+x.t.toFixed(2)+', '+x.n.toLocaleString()+' stock-days, '+x.nt+' stocks)':'—';
+      tipEl.innerHTML='<div class="tt-head">'+r.p[1]+'</div><div>Whole sample: '+q(r.f)+'</div><div>95% CI: '+fmtB(a)+' to '+fmtB(b)+' bp · '+fmtP(r.f.p)+'</div><div>First 70%: '+q(r.e)+'</div><div>Last 30%: '+q(r.l)+'</div>';
+      tipEl.hidden=false; const rr=s.getBoundingClientRect(); let left=ev.clientX-rr.left+14; if(left>rr.width-300) left-=320; tipEl.style.left=Math.max(0,left)+'px'; tipEl.style.top=(y/H*rr.height+10)+'px'; });
+    hit.addEventListener('mouseleave',()=>{ tipEl.hidden=true; });
   });
+}
+function drawMethods(){
+  const v=ST.validation||{}, nw=v.new_lexicon||{}, od=v.old_score||{}, mix=v.mix||{}, P=ST.params||{};
+  const pc=x=>x==null?'—':(100*x).toFixed(0)+'%';
+  const soc=mix.social||{}, nws=mix.news||{}, ns=(soc.tag||0)+(soc.lex||0)+(soc.none||0), nn=(nws.lex||0)+(nws.move||0)+(nws.none||0);
+  $('methods').innerHTML=
+   '<h4>Stance (how each mention is scored)</h4><ul>'+
+   '<li><b>StockTwits posts tagged Bullish or Bearish by the poster</b> use that tag (+1 / −1): '+pc(ns?(soc.tag||0)/ns:null)+' of social mentions.</li>'+
+   '<li>Other text uses a finance word list based on Loughran-McDonald, with words that describe a price move (“fell”, “surged”, “rally”) and uncertainty words (“risk”, “volatile”) removed, and simple negation handling. Stance = (bullish − bearish hits) / (all hits).</li>'+
+   '<li><b>No stance</b> when a mention has no hits ('+pc(ns?(soc.none||0)/ns:null)+' of social, '+pc(nn?(nws.none||0)/nn:null)+' of news), and for news whose text only reports a price move ('+pc(nn?(nws.move||0)/nn:null)+' of news): a headline that says a stock fell is about the past move, and scoring it would make sentiment follow price by construction. These still count as mention volume.</li>'+
+   '<li>A window needs at least '+P.min_n+' mentions with a stance ('+P.min_n_news+' for news) to have a sentiment value.</li></ul>'+
+   '<h4>Checking the word list against posters’ own tags</h4><p>On '+(v.tagged_posts||0).toLocaleString()+' tagged posts ('+pc(v.tagged_bull_share)+' Bullish), scoring the text alone and ignoring the tag:</p>'+
+   '<table><thead><tr><th>Scorer</th><th class="num">Posts with a score</th><th class="num">Bullish caught</th><th class="num">Bearish caught</th><th class="num">Balanced accuracy</th></tr></thead><tbody>'+
+   '<tr><td>Word list used here</td><td class="num">'+pc(nw.coverage)+'</td><td class="num">'+pc(nw.bull_recall)+'</td><td class="num">'+pc(nw.bear_recall)+'</td><td class="num">'+pc(nw.balanced_acc)+'</td></tr>'+
+   '<tr><td>Previous word list</td><td class="num">'+pc(od.coverage)+'</td><td class="num">'+pc(od.bull_recall)+'</td><td class="num">'+pc(od.bear_recall)+'</td><td class="num">'+pc(od.balanced_acc)+'</td></tr></tbody></table>'+
+   '<p style="margin-top:6px;">A word list reads only about a quarter of short social posts, and gets roughly one in four of those wrong (50% is a coin flip). That is why the tags carry most of the social signal, and why a model-based scorer would be the next upgrade.</p>'+
+   '<h4>Timing</h4><ul><li>Windows follow the NYSE clock, not calendar dates: <b>day</b> = prior close to close; <b>overnight + pre-market</b> = prior close to the first regular-hours price; <b>regular</b> = that price to the close.</li>'+
+   '<li>Sentiment is always measured in a window that ends before the return window starts.</li></ul>'+
+   '<h4>Returns and controls</h4><ul><li>Log returns minus the average return of every other tracked stock over the same window (market-adjusted), with extreme values capped at the 0.5th / 99.5th percentile.</li>'+
+   '<li>Controls: the stock’s own return in the window just before (already known when the prediction is made) and its mention volume, plus stock fixed effects. Sentiment is standardised within each stock, because some stocks’ crowds are always more bullish than others.</li>'+
+   '<li>Earnings: trading days '+((P.earn_window||[-1,2])[0])+' to +'+((P.earn_window||[-1,2])[1])+' around each report are flagged, so every test can be run with them included, excluded, or alone.</li></ul>'+
+   '<h4>Significance</h4><ul><li>Standard errors are clustered by date, because a market-wide story moves every stock on the same day.</li>'+
+   '<li>Robustness: the same regression on the first 70% and the last 30% of dates; a long-short check (each day, top fifth of stocks by sentiment minus bottom fifth); and for single stocks, a Benjamini-Hochberg false-discovery count at 10%, since 600+ stocks tested at p < 0.05 give about 30 “hits” by chance.</li></ul>'+
+   '<h4>Known limits</h4><ul><li>About five months of dense mention history; StockTwits is sampled at up to 20 posts an hour per stock, and news is thin for most stocks.</li>'+
+   '<li>The market adjustment uses this tracked universe, not an index, and does not adjust for sector.</li>'+
+   '<li>The open is the first regular-session hourly price (up to 90 minutes after 9:30), not the official opening auction.</li></ul>';
+}
+document.querySelectorAll('#stScope button').forEach(b=>b.addEventListener('click',()=>{ study.scope=b.getAttribute('data-v'); drawStudy(); }));
+document.querySelectorAll('#stReg button').forEach(b=>b.addEventListener('click',()=>{ study.reg=b.getAttribute('data-v'); drawStudy(); }));
 
-  // price path
-  let dp='',st=false;
-  pricePts.forEach(o=>{ dp+=(st?'L':'M')+X(o.t)+' '+yPrice(o.v)+' '; st=true; });
-  svg.appendChild(el('path',{d:dp,fill:'none',stroke:'var(--price)','stroke-width':2,'stroke-linejoin':'round'}));
-
-  // sentiment (smoothed decayed EWMA) on daily grid within window.
-  // Build the full list of non-null points, then draw from the last point BEFORE
-  // the window through the first point AFTER it — so the segments that cross the
-  // window edges are drawn and the line spans the full visible range (mirrors the
-  // price path's ±margin). A hard inWin filter here would drop those crossing
-  // segments and leave the (daily-sampled) line stopping short inside the window.
-  const sentPts=[];
-  S.sentiment_decayed.forEach((v,i)=>{ if(v==null)return;
-    sentPts.push({t:dayToT(a.dates[i])+13*HOUR, v}); });
-  // index range that brackets the window: keep one point beyond each edge
-  let sLo=0, sHi=sentPts.length-1;
-  for(let i=0;i<sentPts.length;i++){ if(sentPts[i].t<=tMin) sLo=i; if(sentPts[i].t>=tMax){ sHi=i; break; } }
-  let ds='',st2=false;
-  for(let i=sLo;i<=sHi && i<sentPts.length;i++){
-    ds+=(st2?'L':'M')+X(sentPts[i].t)+' '+yShift(sentPts[i].v)+' '; st2=true; }
-  svg.appendChild(el('path',{d:ds,fill:'none',stroke:'var(--senti)','stroke-width':2.4,'stroke-linejoin':'round','stroke-linecap':'round'}));
-  // daily sentiment-level dots: keep the in-window filter (dots outside the window
-  // would sit in the margins and look like stray marks).
-  S.sentiment_level.forEach((v,i)=>{ if(v==null)return; const t=dayToT(a.dates[i])+13*HOUR;
-    if(!inWin(t))return; svg.appendChild(el('circle',{cx:X(t),cy:yShift(v),r:2.4,fill:'var(--senti)','fill-opacity':0.35})); });
-
-  // axis titles
-  svg.appendChild(txt(16,(yTop+yBot)/2,'Price ($)','axistitle','middle',{transform:`rotate(-90,16,${(yTop+yBot)/2})`,fill:'var(--price)'}));
-  svg.appendChild(txt(CW-14,(yTop+yBot)/2,'Sentiment (−1 to +1)','axistitle','middle',{transform:`rotate(90,${CW-14},${(yTop+yBot)/2})`,fill:'var(--senti)'}));
-  svg.appendChild(txt(CW/2,CH-6,'Date','axistitle','middle'));
-
-  // x tick labels (date, and time-of-day when intraday)
-  const nTicks=4;
-  for(let k=0;k<=nTicks;k++){ const t=tMin+tSpan*k/nTicks;
-    const d=new Date(t*1000);
-    const lbl = useIntraday
-      ? d.toLocaleDateString('en-US',{month:'short',day:'numeric',timeZone:'America/New_York'})+' '+d.toLocaleTimeString('en-US',{hour:'numeric',timeZone:'America/New_York'})
-      : fmtDate(d.toISOString().slice(0,10));
-    svg.appendChild(txt(X(t),CH-28,lbl,'axislbl','middle')); }
-
-  // session legend (only when shading is shown). Use the STRONG swatch colors so the
-  // sessions are clearly distinguishable, even though the chart bands are lighter.
-  const leg=document.getElementById('sessLegend');
-  if(showSessions){ leg.style.display='flex';
-    leg.innerHTML=['p','r','a','o','w','h'].map(c=>
-      `<span><i style="background:${SESSION_SWATCH[c]};border:1px solid rgba(0,0,0,0.25)"></i>${SESSION_NAME[c]}</span>`).join(''); }
-  else leg.style.display='none';
-
-  // zoom hint / reset button state
-  document.getElementById('zoomReset').style.display = viewWin ? 'inline-block' : 'none';
-  document.getElementById('zoomHint').textContent = viewWin
-    ? (showSessions? 'Zoomed in — session shading on. Drag to zoom further, or Reset.' : 'Drag to zoom further, or Reset.')
-    : 'Tip: drag across the chart to zoom in (sessions shade when zoomed to intraday).';
-
-  setupZoom(svg, X, tMin, tMax, ext);
+// ======================================================================
+// Per-stock lead/lag with chance band
+// ======================================================================
+function drawLagBars(svgId,tipId,rows,unitLabel,lagName,leftLbl,rightLbl){
+  const s=$(svgId), tipEl=$(tipId); s.innerHTML=''; tipEl.hidden=true;
+  const W=960,H=230,mL=56,mR=18,mT=26,mB=46;
+  const ok=(rows||[]).filter(r=>r[1]!=null);
+  if(!ok.length){ s.appendChild(txt(W/2,H/2,'Not enough overlapping data for this stock and source yet.','tick','middle')); return; }
+  const ks=rows.map(r=>r[0]), kmin=Math.min(...ks), kmax=Math.max(...ks), nK=kmax-kmin+1;
+  let m=0.3; ok.forEach(r=>{ m=Math.max(m,Math.abs(r[1]),1.96/Math.sqrt(Math.max(4,r[2]))); }); m=Math.ceil(m*1.15*10)/10;
+  const cx=k=>mL+(W-mL-mR)*((k-kmin+0.5)/nK), y0=mT+(H-mT-mB)/2, yS=v=>y0-v/m*((H-mT-mB)/2), bw=(W-mL-mR)/nK*0.56;
+  [-m,-m/2,m/2,m].forEach(v=>{ const yy=yS(v); el('line',{x1:mL,x2:W-mR,y1:yy,y2:yy,class:'grid'},s); s.appendChild(txt(mL-6,yy+4,(v>0?'+':'−')+Math.abs(v).toFixed(2),'tick','end')); });
+  rows.forEach(r=>{ if(r[2]<4) return; const b=1.96/Math.sqrt(r[2]); el('rect',{x:cx(r[0])-bw/2-5,y:yS(b),width:bw+10,height:yS(-b)-yS(b),rx:3,class:'band'},s); });
+  el('line',{x1:mL,x2:W-mR,y1:y0,y2:y0,class:'zero'},s);
+  el('line',{x1:cx(0),x2:cx(0),y1:mT,y2:H-mB,class:'brk','stroke-dasharray':'2 3'},s);
+  rows.forEach(r=>{ const k=r[0];
+    s.appendChild(txt(cx(k),H-mB+16,(k>0?'+':k<0?'−':'')+Math.abs(k),'tick','middle'));
+    if(r[1]==null) return;
+    const sig=r[2]>=4 && Math.abs(r[1])>1.96/Math.sqrt(r[2]), yy=yS(r[1]), h=Math.max(1,Math.abs(yy-y0));
+    // bar with rounded data end anchored to the zero line
+    const x=cx(k)-bw/2, rr=Math.min(4,h);
+    const d=r[1]>=0? 'M'+x+' '+y0+'V'+(y0-h+rr)+'Q'+x+' '+(y0-h)+' '+(x+rr)+' '+(y0-h)+'H'+(x+bw-rr)+'Q'+(x+bw)+' '+(y0-h)+' '+(x+bw)+' '+(y0-h+rr)+'V'+y0+'Z'
+                   : 'M'+x+' '+y0+'V'+(y0+h-rr)+'Q'+x+' '+(y0+h)+' '+(x+rr)+' '+(y0+h)+'H'+(x+bw-rr)+'Q'+(x+bw)+' '+(y0+h)+' '+(x+bw)+' '+(y0+h-rr)+'V'+y0+'Z';
+    el('path',{d,class:sig?'bar-sig':'bar-ns'},s);
+    const hit=el('rect',{x:cx(k)-(W-mL-mR)/nK/2,y:mT,width:(W-mL-mR)/nK,height:H-mT-mB,fill:'transparent'},s);
+    hit.addEventListener('mousemove',ev=>{ const p=(function(){ const t=r[1]*Math.sqrt((r[2]-2)/Math.max(1e-9,1-r[1]*r[1])); return Math.min(1,2*(1-ncdf(Math.abs(t)))); })();
+      tipEl.innerHTML='<div class="tt-head">'+lagName(k)+'</div><div>Correlation: '+(r[1]>=0?'+':'−')+Math.abs(r[1]).toFixed(3)+'</div><div>Chance band: ±'+(1.96/Math.sqrt(r[2])).toFixed(3)+' · '+fmtP(p)+'</div><div class="muted">'+r[2]+' '+unitLabel+'</div>';
+      tipEl.hidden=false; const rc=s.getBoundingClientRect(); let left=ev.clientX-rc.left+14; if(left>rc.width-230) left-=250; tipEl.style.left=Math.max(0,left)+'px'; });
+    hit.addEventListener('mouseleave',()=>{ tipEl.hidden=true; });
+  });
+  s.appendChild(txt(14,y0,'Correlation','axis-title','middle',{transform:'rotate(-90 14 '+y0+')'}));
+  s.appendChild(txt((mL+W-mR)/2,H-8,'Offset','axis-title','middle'));
+  s.appendChild(txt(mL,14,leftLbl,'lbl2','start')); s.appendChild(txt(W-mR,14,rightLbl,'lbl2','end'));
+}
+function ncdf(x){ const t=1/(1+0.2316419*x), d=0.3989423*Math.exp(-x*x/2); return 1-d*t*(0.3193815+t*(-0.3565638+t*(1.781478+t*(-1.821256+t*1.330274)))); }
+function drawStockLags(S){
+  const reg=$('earnReg').value, sc=view.scope, ll=S.ll||{};
+  const daily=((ll.daily||{})[sc]||{})[reg], sess=((ll.sess||{})[sc]||{})[reg];
+  drawLagBars('lag','ltip',daily,'trading days with both values',
+    k=>k>0?'Sentiment, then the return '+k+' trading day'+(k>1?'s':'')+' later':k<0?'Return, then sentiment '+(-k)+' trading day'+(k<-1?'s':'')+' later':'Same trading day',
+    '← sentiment follows the move','sentiment comes before the move →');
+  drawLagBars('sesslag','stip',sess,'half-day windows with both values',
+    k=>k>0?'Sentiment, then the return '+k+' half-day step'+(k>1?'s':'')+' later':k<0?'Return, then sentiment '+(-k)+' half-day step'+(k<-1?'s':'')+' later':'Same half-day window',
+    '← sentiment follows the move','sentiment comes before the move →');
 }
 
-// drag-to-zoom overlay
-function setupZoom(svg, X, tMin, tMax, ext){
-  const yTop=cmT, yBot=CH-cmB;
-  let sx=null, rect=null;
-  const invX=px=>{ const frac=(px-cmL)/(CW-cmL-cmR); return tMin+frac*(tMax-tMin); };
-  const pt=evt=>{ const r=svg.getBoundingClientRect();
-    return (evt.clientX-r.left)/r.width*CW; };
-  svg.style.cursor='crosshair';
-  svg.onmousedown=e=>{ sx=pt(e);
-    rect=el('rect',{x:sx,y:yTop,width:0,height:yBot-yTop,fill:'#3b5bdb','fill-opacity':0.12,stroke:'#3b5bdb','stroke-dasharray':'3 2'});
-    svg.appendChild(rect); };
-  svg.onmousemove=e=>{ if(sx===null)return; const cx=pt(e);
-    const x0=Math.min(sx,cx), w=Math.abs(cx-sx);
-    rect.setAttribute('x',x0); rect.setAttribute('width',w); };
-  svg.onmouseup=e=>{ if(sx===null)return; const cx=pt(e);
-    const a=invX(Math.min(sx,cx)), b=invX(Math.max(sx,cx)); sx=null;
-    if(rect){rect.remove();rect=null;}
-    if(b-a >= HOUR){ viewWin=[Math.max(a,ext[0]),Math.min(b,ext[1])]; redraw(); } };
-  svg.onmouseleave=()=>{ if(rect){rect.remove();rect=null;} sx=null; };
-}
-function redraw(){ if(curTk) drawChart(A[curTk], curScope); }
-
-function drawLag(a, scope){
-  const svg=document.getElementById('lag'); svg.innerHTML='';
-  const W=1000,H=220,mL=52,mR=18,mT=20,mB=44;
-  const xc=a.scopes[scope].xcorr_level||{};
-  const cx=k=> mL + (W-mL-mR)*((k+7)/14);
-  const y0=(H-mB+mT)/2, yS=v=> y0 - (H/2-mT-8)*v;
-  svg.appendChild(el('line',{x1:mL,y1:y0,x2:W-mR,y2:y0,stroke:'var(--hair)','stroke-width':1}));
-  [-1,-0.5,0.5,1].forEach(v=>{ const yy=yS(v);
-    svg.appendChild(el('line',{x1:mL,y1:yy,x2:W-mR,y2:yy,class:'gridln'}));
-    svg.appendChild(txt(mL-5,yy+3,v.toFixed(1),'axislbl','end')); });
-  const bw=(W-mL-mR)/14*0.55;
-  for(let k=-7;k<=7;k++){ const c=xc[k]?xc[k].corr:0; const yy=yS(c); const h=Math.abs(y0-yy);
-    svg.appendChild(el('rect',{x:cx(k)-bw/2,y:Math.min(y0,yy),width:bw,height:h||0.6,class:'lagbar '+(c>=0?'pos':'neg'),rx:2}));
-    svg.appendChild(txt(cx(k),H-24,(k>0?'+':'')+k,'axislbl','middle')); }
-  // axis titles
-  svg.appendChild(txt(12,(y0),'Correlation','axistitle','middle',{transform:`rotate(-90,12,${y0})`}));
-  svg.appendChild(txt(W/2,H-6,'Offset in days (sentiment vs future price return)','axistitle','middle'));
-  svg.appendChild(txt(mL,12,'← sentiment reacts to price','axislbl','start'));
-  svg.appendChild(txt(W-mR,12,'sentiment leads price →','axislbl','end'));
-}
-
-// ---- Session lead/lag: full path vs regular-hours-only, hour offsets ----
-function drawSessionLag(tk){
-  const svg=document.getElementById('sesslag'); svg.innerHTML='';
-  const vbox=document.getElementById('sessVerdict');
-  const S=(D.session||{})[tk];
-  if(!S || (!S.full_best_corr && !S.regular_best_corr)){
-    vbox.style.display='none';
-    svg.parentElement.style.display='none';
-    return;
-  }
-  svg.parentElement.style.display='';
-  // EARNINGS REGIME: the selected regime re-slices the FULL price path (earnings
-  // contaminate price, so only the full path changes; regular-hours path is shown
-  // for reference). regimeData holds the all/ex_earn/earn xcorr + best lag/corr.
-  const regime=(document.getElementById('earnReg')||{}).value||'all';
-  const R=(S.regime||{})[regime]||null;
-  // full-path xcorr + best point come from the regime slice when available
-  const fullXc = R ? (R.xcorr||{}) : (S.xcorr_full||{});
-  const fullBestLag = R ? R.best_lag_h : S.full_best_lag_h;
-  const fullBestCorr = R ? R.best_corr : S.full_best_corr;
-  // does the chosen regime actually have data? (earnings-only is often empty on
-  // limited intraday history — we say so honestly rather than draw nothing.)
-  const regimeEmpty = (regime!=='all') && (!R || fullBestCorr==null || Object.keys(fullXc).length===0);
-  const W=1000,H=240,mL=54,mR=18,mT=24,mB=46, LAG=24;
-  const cx=k=> mL + (W-mL-mR)*((k+LAG)/(2*LAG));
-  const y0=(H-mB+mT)/2, yS=v=> y0 - (H/2-mT-10)*v;
-  // axes
-  svg.appendChild(el('line',{x1:mL,y1:y0,x2:W-mR,y2:y0,stroke:'var(--hair)','stroke-width':1}));
-  [-1,-0.5,0.5,1].forEach(v=>{ const yy=yS(v);
-    svg.appendChild(el('line',{x1:mL,y1:yy,x2:W-mR,y2:yy,class:'gridln'}));
-    svg.appendChild(txt(mL-5,yy+3,v.toFixed(1),'axislbl','end')); });
-  // zero-offset vertical guide
-  svg.appendChild(el('line',{x1:cx(0),y1:mT,x2:cx(0),y2:H-mB,class:'zeroln'}));
-  // draw a correlation curve as a line
-  const curve=(xc,color)=>{ let d='',st=false;
-    for(let k=-LAG;k<=LAG;k++){ const o=xc[String(k)]; if(!o)continue;
-      d+=(st?'L':'M')+cx(k)+' '+yS(o.corr)+' '; st=true; }
-    if(d) svg.appendChild(el('path',{d,fill:'none',stroke:color,'stroke-width':2.2,'stroke-linejoin':'round'})); };
-  curve(fullXc, 'var(--price)');
-  curve(S.xcorr_regular||{}, 'var(--senti)');
-  // mark the best-lag points
-  const mark=(lag,corr,color)=>{ if(lag==null||corr==null)return;
-    svg.appendChild(el('circle',{cx:cx(lag),cy:yS(corr),r:4,fill:color})); };
-  mark(fullBestLag,fullBestCorr,'var(--price)');
-  mark(S.regular_best_lag_h,S.regular_best_corr,'var(--senti)');
-  // honest "accumulating" note when the chosen earnings regime has no data yet
-  if(regimeEmpty){
-    const msg = regime==='earn'
-      ? 'Not enough earnings-window data yet to plot the earnings-only regime — accumulating as intraday history deepens.'
-      : 'No earnings windows overlap this stock’s intraday data yet.';
-    svg.appendChild(txt(W/2,H/2,msg,'axislbl','middle',{fill:'var(--faint)'}));
-  }
-  // x ticks (hours)
-  [-24,-12,0,12,24].forEach(k=>{ svg.appendChild(txt(cx(k),H-24,(k>0?'+':'')+k+'h','axislbl','middle')); });
-  svg.appendChild(txt(12,y0,'Correlation','axistitle','middle',{transform:`rotate(-90,12,${y0})`}));
-  svg.appendChild(txt(W/2,H-6,'Offset in hours (sentiment vs future price return)','axistitle','middle'));
-  svg.appendChild(txt(mL,14,'← sentiment reacts to price','axislbl','start'));
-  svg.appendChild(txt(W-mR,14,'sentiment leads price →','axislbl','end'));
-  // inline legend (larger swatches + text)
-  svg.appendChild(el('rect',{x:W/2-210,y:3,width:26,height:7,rx:2,fill:'var(--price)'}));
-  svg.appendChild(txt(W/2-178,12,'full path (incl. extended hours)','leglbl','start'));
-  svg.appendChild(el('rect',{x:W/2+40,y:3,width:26,height:7,rx:2,fill:'var(--senti)'}));
-  svg.appendChild(txt(W/2+72,12,'regular hours only','leglbl','start'));
-
-  // ---- plain-language verdict ----
-  vbox.style.display='';
-  const fl=fullBestLag, fc=fullBestCorr, rl=S.regular_best_lag_h, rc=S.regular_best_corr;
-  const regLabel = regime==='ex_earn' ? ' (earnings windows excluded)'
-                 : regime==='earn' ? ' (earnings windows only)' : '';
-  const fmtH=(l,c)=>{ if(l==null||c==null)return 'no clear relationship';
-    const dir=l>0?`leads by ${l}h`:l<0?`lags by ${-l}h`:'is coincident';
-    const str=Math.abs(c)>=0.5?'strong':Math.abs(c)>=0.3?'moderate':'weak';
-    return `${dir} (${str}, r=${c>=0?'+':''}${c.toFixed(2)})`; };
-  let interp='', cls='coincide-tag';
-  if(rl!=null && fl!=null){
-    if(rl>0 && fl<=0){ interp='Sentiment appears to lead the regular-hours price, but not the full path, which suggests the move was largely <b>priced in during extended hours</b> before the regular session opened. A retail trader active only in regular hours would likely have been <span class="tag lag-tag">too late</span>.'; cls='lag-tag'; }
-    else if(rl>0 && fl>0){ interp='Sentiment appears to lead <b>both</b> the regular and full price paths, which is the pattern most consistent with a <span class="tag lead-tag">genuinely anticipatory</span>, potentially actionable signal.'; cls='lead-tag'; }
-    else if(rl<=0){ interp='Sentiment does not clearly lead the regular-hours price; it looks more <span class="tag lag-tag">reactive</span> than predictive here.'; cls='lag-tag'; }
-    else { interp='The relationship is mixed and does not cleanly indicate lead or lag.'; }
-  } else { interp='Not enough overlapping hourly data yet to judge the extended-hours question for this stock; it will sharpen as intraday data accumulates.'; }
-
-  // earnings regime context
-  const nEv=S.n_earnings_events||0, nEh=S.n_earnings_price_hours||0;
-  if(regimeEmpty){
-    const en = regime==='earn'
-      ? `This stock has ${nEv} known earnings date${nEv===1?'':'s'}, but too few fall inside its intraday window to measure yet (accumulating).`
-      : `No earnings windows overlap the intraday data yet.`;
-    vbox.innerHTML=`<b>Earnings regime${regLabel}.</b> ${en} `
-      +`<span style="color:var(--faint);font-size:13px;">The control is in place and will produce a comparison as intraday history deepens.</span>`;
-    return;
-  }
-  let earnNote='';
-  if(nEv){ earnNote=` <span style="color:var(--faint);font-size:13px;">`
-    +(regime==='all'
-        ? `This stock has ${nEv} known earnings date${nEv===1?'':'s'}; ${nEh} price-hour${nEh===1?'':'s'} fall in an earnings window — use the Earnings control to exclude or isolate them.`
-        : `Computed on the ${regime==='earn'?'earnings-only':'earnings-excluded'} slice (${nEh} earnings price-hour${nEh===1?'':'s'}).`)
-    +`</span>`; }
-
-  vbox.innerHTML=`Against the <b style="color:var(--price)">full price path</b>${regLabel}, sentiment ${fmtH(fl,fc)}. `
-    +`Against the <b style="color:var(--senti)">regular-hours-only path</b>, it ${fmtH(rl,rc)}. `
-    +`<span class="${cls}">${interp}</span>`
-    +earnNote+` `
-    +`<span style="color:var(--faint);font-size:13px;">(Based on ${S.n_sent_hours||0} sentiment-hours; illustrative until more intraday data accumulates.)</span>`;
-}
-
-function drawStats(a, scope){
-  const S=a.scopes[scope];
-  const c=(S.best_level_corr??0);
-  const strength=Math.abs(c)>=0.5?'strong':Math.abs(c)>=0.3?'moderate':'weak';
-  const ll=S.best_level_lag>0?'lead':'lag';
-  document.getElementById('stats').innerHTML=`
-    <div class="stat"><div class="k">Best correlation</div><div class="v">${c>=0?'+':''}${c.toFixed(2)}</div><small>${strength} · ${scope}</small></div>
-    <div class="stat"><div class="k">Timing</div><div class="v ${ll}">${fmtLag(S.best_level_lag)}</div><small>at peak correlation</small></div>
-    <div class="stat"><div class="k">Mentions (${scope})</div><div class="v">${S.n_mentions}</div><small>social ${a.social_mentions} · news ${a.news_mentions}</small></div>
-    <div class="stat"><div class="k">Overlap</div><div class="v">${S.n_overlap} days</div><small>sentiment ∩ price</small></div>`;
-  document.getElementById('catline').innerHTML=
-    `Category: <b>${a.sector}</b> · <b>${a.industry}</b> · <b>${a.mcap_bucket}-cap</b> · leans <b>${a.source_favored}</b>`;
-  const cav=document.getElementById('caveat');
-  if(S.n_overlap<20){cav.style.display='block';
-    cav.innerHTML=`⚠ Only ${S.n_overlap} overlapping days for “${scope}”: correlation is <b>illustrative, not significant</b>; it firms up as mentions accumulate.`;}
+// ======================================================================
+// Per-stock stats tiles
+// ======================================================================
+function drawStats(tk,a,scope){
+  const v=a.v2||{}, reg=$('earnReg').value, k1=((v.k1||{})[scope]||{})[reg]||{};
+  const r=k1.r, n=k1.n||0, p=k1.p;
+  $('stats').innerHTML=
+    '<div class="stat"><div class="k">Next-day correlation</div><div class="v">'+(r==null?'—':(r>=0?'+':'−')+Math.abs(r).toFixed(2))+'</div><small>'+(r==null?'not enough data':fmtP(p)+' · '+n+' days · '+(p!=null&&p<0.05?'outside':'inside')+' chance band')+'</small></div>'+
+    '<div class="stat"><div class="k">Mentions</div><div class="v">'+(v.n_m!=null?v.n_m.toLocaleString():(a.n_mentions||0))+'</div><small>'+(v.n_st!=null?v.n_st.toLocaleString()+' with a stance · ':'')+'social '+a.social_mentions+' · news '+a.news_mentions+'</small></div>'+
+    '<div class="stat"><div class="k">Earnings reports</div><div class="v">'+(v.n_ev||0)+'</div><small>in the price history</small></div>';
+  $('catline').innerHTML='Category: <b>'+a.sector+'</b> · <b>'+a.industry+'</b> · <b>'+a.mcap_bucket+'-cap</b> · leans <b>'+a.source_favored+'</b>';
+  const cav=$('caveat');
+  if(r!=null && n<40){ cav.style.display='block'; cav.innerHTML='Only '+n+' trading days with enough '+(scope==='both'?'':scope+' ')+'mentions for '+tk+': per-stock correlations this small-sample are <b>illustrative</b>. The study-wide results above pool every stock.'; }
   else cav.style.display='none';
 }
 
-function render(tk){ tkSel.value=tk; const a=A[tk]; const scope=srcSel.value;
-  viewWin=null;  // reset zoom when switching stock/source
-  const useScope=(a.scopes[scope].n_mentions>0)?scope:'both';
-  // show the earnings controls/legend only for tickers that actually have earnings
-  const hasEarn=!!((D.earnings||{})[tk] && D.earnings[tk].length);
-  const el1=document.getElementById('earnRegWrap'); if(el1) el1.style.display=hasEarn?'':'none';
-  const el2=document.getElementById('earnLegend'); if(el2) el2.style.display=hasEarn?'inline-flex':'none';
-  drawStats(a,useScope); drawChart(a,useScope); drawLag(a,useScope); drawSessionLag(tk); }
-
+// ======================================================================
+// Controls
+// ======================================================================
+const tkSel=$('tkSel'), srcSel=$('srcSel'), catSel=$('catSel'), catVal=$('catVal'), catValWrap=$('catValWrap');
+function catValue(tk,key){ return key==='all'?'all':(A[tk][key]||'unknown'); }
+function fillStocks(list){ tkSel.innerHTML=''; list.forEach(tk=>{ const o=document.createElement('option'); o.value=tk;
+  const v=A[tk].v2; o.textContent=tk+'  ('+((v&&v.n_m!=null)?v.n_m:A[tk].n_mentions).toLocaleString()+' mentions)'; tkSel.appendChild(o); }); }
+function populateStocks(){ const cat=catSel.value, f=catVal.value; const list=D.order.filter(tk=>cat==='all'||catValue(tk,cat)===f);
+  fillStocks(list); if(list.length) render(list[0]); }
+function populateCatValues(){ const cat=catSel.value; if(cat==='all'){ catValWrap.style.display='none'; populateStocks(); return; }
+  const vals=[...new Set(D.order.map(tk=>catValue(tk,cat)))].sort(); catVal.innerHTML='';
+  vals.forEach(v=>{ const o=document.createElement('option'); o.value=v; o.textContent=v; catVal.appendChild(o); });
+  catValWrap.style.display=''; populateStocks(); }
+function render(tk){
+  tkSel.value=tk; const a=A[tk]; let scope=srcSel.value; if(!(((a.scopes||{})[scope]||{}).n_mentions>0)) scope='both';
+  view.scope=scope; $('mentionsBtn').href='mentions.html?ticker='+encodeURIComponent(tk);
+  $('earnLegend').style.display=a.he?'inline':'none';
+  drawStats(tk,a,scope); loadMain(tk);
+}
+function syncSeg(id,attr,val){ document.querySelectorAll('#'+id+' button').forEach(b=>{ const on=b.getAttribute(attr)===String(val); b.className=on?'on':''; b.setAttribute('aria-pressed',on?'true':'false'); }); }
+document.querySelectorAll('#range button').forEach(b=>b.addEventListener('click',()=>{ view.days=+b.getAttribute('data-d'); view.zoom=null; syncSeg('range','data-d',view.days); drawMain(); }));
+document.querySelectorAll('#smooth button').forEach(b=>b.addEventListener('click',()=>{ view.smooth=b.getAttribute('data-s'); syncSeg('smooth','data-s',view.smooth); drawMain(); }));
+$('zoomReset').addEventListener('click',()=>{ view.zoom=null; drawMain(); });
 tkSel.addEventListener('change',()=>render(tkSel.value));
 srcSel.addEventListener('change',()=>render(tkSel.value));
-catSel.addEventListener('change',populateCatValues);
-catVal.addEventListener('change',populateStocks);
-const earnRegSel=document.getElementById('earnReg');
-if(earnRegSel) earnRegSel.addEventListener('change',()=>drawSessionLag(tkSel.value));
-document.getElementById('zoomReset').addEventListener('click',()=>{ viewWin=null; redraw(); });
-render(D.order[0]);
+catSel.addEventListener('change',populateCatValues); catVal.addEventListener('change',populateStocks);
+$('earnReg').addEventListener('change',()=>{ const S=CACHE[view.tk]; drawStats(view.tk,A[view.tk],view.scope); if(S) drawStockLags(S); });
+let rz=null; window.addEventListener('resize',()=>{ clearTimeout(rz); rz=setTimeout(drawMain,120); });
+syncSeg('range','data-d',view.days); syncSeg('smooth','data-s',view.smooth);
+drawStudy();
+fillStocks(D.order); if(D.order.length) render(D.order[0]);
 </script>
 """
 
