@@ -66,6 +66,15 @@ python3 analyze.py | head -1
 # embeds for the third plot ("was the move priced in after hours?"). Must run
 # AFTER analyze.py and BEFORE gen_analysis.py. Non-fatal if it fails.
 python3 analyze_sessions.py > /dev/null 2>&1 || echo "  (analyze_sessions failed — third plot may be stale)"
+# label new news items with Claude Haiku 5.5 (Message Batches) -> data/news_llm.jsonl.
+# Needs ANTHROPIC_API_KEY or ~/.anthropic_api_key and `pip install --user anthropic`;
+# without them it prints a note and the study uses word-list scores. Waits up to 20 min
+# for tonight's batch, otherwise it is collected on the next run. Never fails the run.
+python3 news_llm.py --wait 20 2>&1 | tail -3
+# v2 study (sentiment_v2 stance, NYSE-clock windows, market-adjusted returns,
+# pooled tests with earnings controls) -> data/analysis_v2.json, rendered by
+# gen_analysis.py. Read-only over the scraped data. Non-fatal.
+python3 analyze_v2.py 2>&1 | tail -1 || echo "  (analyze_v2 failed — study results may be stale)"
 python3 gen_analysis.py
 # per-ticker raw-mention JSONs for the "View mentions" validation table
 # (mentions.html). Writes mentions_export/<TICKER>.json. Non-fatal.
@@ -106,6 +115,9 @@ if [ "$NO_PUBLISH" = "1" ]; then
 fi
 
 echo "==> [7/8] publish dashboard + mentions to s3://$S3_BUCKET/$S3_PREFIX/ + invalidate"
+# per-stock chart data the v2 dashboard fetches on demand (series/<TICKER>.json).
+# Upload BEFORE index.html so a freshly published page never asks for a missing file.
+aws s3 sync series/ "s3://$S3_BUCKET/$S3_PREFIX/series/" --delete --content-type "application/json" >/dev/null
 aws s3 cp analysis.html "s3://$S3_BUCKET/$S3_PREFIX/index.html"    --content-type "text/html; charset=utf-8" >/dev/null
 # the mentions validation page (static; safe to re-upload each run) + the
 # per-ticker mention JSONs the page fetches on demand.

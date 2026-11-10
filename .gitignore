@@ -22,3 +22,6 @@ scenarios.html
 *.docx
 *.pdf
 held_tickers.txt
+series/
+series.tmp/
+data/news_llm*.json*
